@@ -246,7 +246,10 @@ async function clickPublishOnce(page, plan, beforeSubmit) {
   if (!canonicalRenderedText(previewText).includes(canonicalRenderedText(plan.text))) {
     throw new Error('Текст превью на экране настроек не совпадает с advertisement.md');
   }
-  const previewCount = await settings.locator('[data-testid="posting_preview_attachment_item"]').count();
+  const previewItems = await settings.locator('[data-testid="posting_preview_attachment_item"]').count();
+  const primaryVideos = await settings.locator('[data-testid="primary-attachment-video"]').count();
+  const nestedPrimaryVideos = await settings.locator('[data-testid="posting_preview_attachment_item"] [data-testid="primary-attachment-video"]').count();
+  const previewCount = countPreviewAttachments(previewItems, primaryVideos, nestedPrimaryVideos);
   if (previewCount !== plan.expectedCount) {
     const html = await settings.innerHTML();
     fs.writeFileSync(path.join(os.tmpdir(), 'animal-volunteer-settings-debug.html'), html, 'utf8');
@@ -282,6 +285,10 @@ function canonicalRenderedText(value) {
     .replace(/\nПоказать ещё$/, '')
     .replace(/\n{2,}/g, '\n\n')
     .replace(/\n$/, '');
+}
+
+function countPreviewAttachments(previewItems, primaryVideos, nestedPrimaryVideos) {
+  return previewItems + Math.max(0, primaryVideos - nestedPrimaryVideos);
 }
 
 function matchKnownAdvertisement(value, advertisements) {
@@ -379,6 +386,7 @@ module.exports = {
   authorizationStatus,
   canonicalRenderedText,
   clickPublishOnce,
+  countPreviewAttachments,
   ensureSession,
   fillPostingDialog,
   findResult,
