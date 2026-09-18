@@ -113,9 +113,12 @@ function newPostDialog(page) {
 }
 
 function settingsDialog(page) {
-  return page.locator(
+  const testIdDialog = page.locator(
     '[role="dialog"]:has([data-testid="posting_suggest_button"]), [role="dialog"]:has([data-testid="posting_publish_button"])'
-  ).first();
+  );
+  const submitButton = page.getByRole('button', { name: /^(Опубликовать|Предложить(?: пост| новость)?)$/ });
+  const semanticDialog = page.locator('[role="dialog"]').filter({ has: submitButton });
+  return testIdDialog.or(semanticDialog).first();
 }
 
 function postingDialog(page) {
