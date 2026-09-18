@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
 const { createPostingPlan, hashPlan } = require('./lib/posting-plan');
@@ -11,8 +12,7 @@ const {
   fillPostingDialog,
   findResult,
   selectGroupPage,
-  visiblePostIds,
-  verifyPreparedForm
+  visiblePostIds
 } = require('./lib/vk-browser');
 
 const root = path.resolve(__dirname, '..');
@@ -195,6 +195,66 @@ async function fill(args) {
   });
 }
 
+async function inspectResult(args) {
+  const state = loadState();
+  const plan = checkedPlan(state, { eligibility: false });
+  await withSession(async ({ page }) => {
+    const inspectPage = async () => page.locator('[data-testid="post"]').evaluateAll((posts, animal) => posts.map(post => ({
+      postId: post.getAttribute('data-post-id'),
+      mentionsAnimal: (post.innerText || '').includes(animal),
+      textStart: (post.innerText || '').slice(0, 120),
+      postText: (post.querySelector('[data-testid="post_text"]')?.innerText || '').includes(animal)
+        ? post.querySelector('[data-testid="post_text"]').innerText
+        : null,
+      mediaLinks: new Set([...post.querySelectorAll('a')].map(link => link.getAttribute('href') || '').filter(href => href.includes('/photo') || href.includes('/video'))).size
+    })), plan.animal);
+    if (args.url) {
+      const target = new URL(args.url);
+      if (!/^(?:www\.)?vk\.(?:com|ru)$/i.test(target.hostname) || !target.pathname.startsWith(`/wall${state.expectedOwnerId}_`)) {
+        throw new Error('Диагностическая ссылка должна вести на запись выбранной группы');
+      }
+      await page.goto(target.href, { waitUntil: 'domcontentloaded' });
+      await page.waitForTimeout(3000);
+      const posts = await inspectPage();
+      let screenshot = null;
+      const mediaScreenshots = [];
+      if (args.screenshot) {
+        screenshot = path.join(os.tmpdir(), 'animal-volunteer-result.png');
+        await page.locator(`[data-testid="post"][data-post-id="${target.pathname.slice(5)}"]`).screenshot({ path: screenshot });
+      }
+      if (args['screenshot-all']) {
+        const post = page.locator(`[data-testid="post"][data-post-id="${target.pathname.slice(5)}"]`);
+        const mediaSources = await post.locator('a').evaluateAll(elements => elements
+          .map(element => ({ href: element.getAttribute('href') || '', src: element.querySelector('img')?.src || '' }))
+          .filter(item => (item.href.includes('/photo') || item.href.includes('/video')) && item.src)
+          .filter((item, index, items) => items.findIndex(candidate => candidate.href === item.href) === index)
+          .map(item => item.src));
+        for (let index = 0; index < mediaSources.length; index += 1) {
+          await page.goto(mediaSources[index], { waitUntil: 'load' });
+          const mediaPath = path.join(os.tmpdir(), `animal-volunteer-media-${index + 1}.png`);
+          await page.screenshot({ path: mediaPath });
+          mediaScreenshots.push(mediaPath);
+        }
+      }
+      print({ stage: state.stage, url: target.href, posts, screenshot, mediaScreenshots });
+      return;
+    }
+    await page.goto(plan.group.url, { waitUntil: 'domcontentloaded' });
+    await page.waitForTimeout(3000);
+    const suggested = page.getByText(/Предложенные\s+\d+/).first();
+    const suggestedHref = await suggested.getAttribute('href').catch(() => null);
+    const groupPosts = await inspectPage();
+    let suggestedPosts = [];
+    const suggestedUrl = suggestedHref || (state.expectedOwnerId ? `https://vk.ru/wall${state.expectedOwnerId}?suggested=1` : null);
+    if (suggestedUrl) {
+      await page.goto(new URL(suggestedUrl, page.url()).href, { waitUntil: 'domcontentloaded' });
+      await page.waitForTimeout(3000);
+      suggestedPosts = await inspectPage();
+    }
+    print({ stage: state.stage, suggestedHref: suggestedUrl, groupPosts, suggestedPosts });
+  });
+}
+
 async function publish(args) {
   const state = loadState();
   const plan = checkedPlan(state);
@@ -205,7 +265,6 @@ async function publish(args) {
   if (!args.token || args.token !== state.reviewToken) throw new Error('Нужен reviewToken из команды fill');
   await withSession(async ({ context }) => {
     const page = await selectGroupPage(context, plan, { requireDialog: true });
-    await verifyPreparedForm(page, plan);
     const beforePostIds = await visiblePostIds(page);
     state.beforePostIds = beforePostIds;
     if (state.suggestedHref) {
@@ -218,20 +277,24 @@ async function publish(args) {
         await suggestedPage.close();
       }
     }
-    await clickPublishOnce(page, plan, async () => transition(state, ['form_verified'], 'submit_attempted'));
+    const submission = await clickPublishOnce(page, plan, async () => transition(state, ['form_verified'], 'submit_attempted'));
     const result = await findResult(page, plan, {
       excludedPostIds: [...beforePostIds, ...(state.suggestedPostIds || [])],
       expectedOwnerId: state.expectedOwnerId
     });
     if (!result) {
       transition(state, ['submit_attempted'], 'result_unknown');
-      print({ stage: state.stage, warning: 'Результат не подтвержден. Не повторяйте отправку; выполните verify.' });
+      print({
+        stage: state.stage,
+        dialogClosed: submission.dialogClosed,
+        warning: 'Результат не подтвержден. Не обновляйте страницу и не повторяйте отправку; выполните только verify.'
+      });
       process.exitCode = 3;
       return;
     }
     state.result = result;
     transition(state, ['submit_attempted'], 'result_verified');
-    print({ stage: state.stage, result, next: 'Проверьте все изображения и внесите запись в REPORT.MD' });
+    print({ stage: state.stage, dialogClosed: submission.dialogClosed, result, next: 'Проверьте все изображения и внесите запись в REPORT.MD' });
   });
 }
 
@@ -257,13 +320,42 @@ async function verify() {
   });
 }
 
+async function resolveDeleted(args) {
+  const state = loadState();
+  const plan = checkedPlan(state, { eligibility: false });
+  if (state.stage !== 'result_unknown') throw new Error(`Команда resolve-deleted недоступна в состоянии ${state.stage}`);
+  if (!args.url) throw new Error('Укажите --url удалённой записи');
+  const target = new URL(args.url);
+  if (!/^(?:www\.)?vk\.(?:com|ru)$/i.test(target.hostname) || !target.pathname.startsWith(`/wall${state.expectedOwnerId}_`)) {
+    throw new Error('Ссылка должна вести на запись выбранной группы');
+  }
+  await withSession(async ({ page }) => {
+    await page.goto(target.href, { waitUntil: 'domcontentloaded' });
+    await page.waitForTimeout(2000);
+    const post = page.locator(`[data-testid="post"][data-post-id="${target.pathname.slice(5)}"]`);
+    if (!await post.count() || !/Пост удалён/.test(await post.innerText())) {
+      throw new Error('VK не подтверждает, что эта запись удалена');
+    }
+    state.result = { type: 'deleted', url: target.href };
+    transition(state, ['result_unknown'], 'result_deleted');
+    print({ stage: state.stage, result: state.result, next: 'Можно подготовить другую группу с prepare --replace' });
+  });
+}
+
 function status() {
   const state = loadState();
-  print({ stage: state.stage, animal: state.plan.animal, group: state.plan.group, expectedCount: state.plan.expectedCount, result: state.result || null });
+  print({
+    stage: state.stage,
+    animal: state.plan.animal,
+    group: state.plan.group,
+    expectedCount: state.plan.expectedCount,
+    reviewToken: state.stage === 'form_verified' ? state.reviewToken : null,
+    result: state.result || null
+  });
 }
 
 function usage() {
-  process.stdout.write(`Команды:\n  prepare --animal <имя> --group-url <url> --media-reviewed [--replace]\n  session\n  open-group\n  fill --suggested-reviewed\n  publish --token <reviewToken>\n  verify\n  status\n`);
+  process.stdout.write(`Команды:\n  prepare --animal <имя> --group-url <url> --media-reviewed [--replace]\n  session\n  open-group\n  fill --suggested-reviewed\n  publish --token <reviewToken>\n  verify\n  inspect-result [--url <post-url>] [--screenshot-all]\n  resolve-deleted --url <post-url>\n  status\n`);
 }
 
 async function main() {
@@ -273,8 +365,10 @@ async function main() {
   if (command === 'session') return sessionCommand();
   if (command === 'open-group') return withLock(() => openGroup());
   if (command === 'fill') return withLock(() => fill(args));
+  if (command === 'inspect-result') return inspectResult(args);
   if (command === 'publish') return withLock(() => publish(args));
   if (command === 'verify') return withLock(() => verify());
+  if (command === 'resolve-deleted') return withLock(() => resolveDeleted(args));
   if (command === 'status') return status();
   usage();
   if (command) process.exitCode = 1;

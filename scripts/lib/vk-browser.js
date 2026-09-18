@@ -1,4 +1,5 @@
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
 const { spawn } = require('child_process');
@@ -99,7 +100,7 @@ async function selectGroupPage(context, plan, { requireDialog = false } = {}) {
       // Ignore non-HTTP browser pages.
     }
     if (key !== plan.group.key) continue;
-    if (requireDialog && !await newPostDialog(page).count()) continue;
+    if (requireDialog && !await postingDialog(page).count()) continue;
     candidates.push(page);
   }
   if (candidates.length !== 1) throw new Error(`Ожидалась одна вкладка выбранной группы, найдено: ${candidates.length}`);
@@ -109,6 +110,16 @@ async function selectGroupPage(context, plan, { requireDialog = false } = {}) {
 
 function newPostDialog(page) {
   return page.locator('[role="dialog"]').filter({ hasText: 'Новый пост' }).first();
+}
+
+function settingsDialog(page) {
+  return page.locator(
+    '[role="dialog"]:has([data-testid="posting_suggest_button"]), [role="dialog"]:has([data-testid="posting_publish_button"])'
+  ).first();
+}
+
+function postingDialog(page) {
+  return newPostDialog(page).or(settingsDialog(page)).first();
 }
 
 async function openPostingDialog(page) {
@@ -143,22 +154,56 @@ async function editorText(editor) {
 
 async function fillPostingDialog(page, plan) {
   const dialog = await openPostingDialog(page);
+  const editor = dialog.locator('[data-testid="posting_base_screen_input_message"]');
+  if (!await editor.count()) throw new Error('Редактор текста в диалоге не найден');
+  const draftCount = await dialog.locator('[data-testid="posting_attachment_item"]').count();
+  const draftText = await editorText(editor);
+  const expectedText = normalizeNewlines(plan.text);
+  const draftHtml = await editor.innerHTML();
+  const draftMatches = draftText === expectedText || (draftText === `${expectedText}\n` && /<br><br>\s*$/.test(draftHtml));
+  if (draftCount === plan.expectedCount && draftMatches) {
+    return { count: draftCount, textVerified: true, restoredDraft: true };
+  }
+  if (draftCount || draftText.trim()) {
+    for (let remaining = draftCount; remaining > 0; remaining -= 1) {
+      const remove = dialog.locator('[data-testid="posting_attachment_photo_item_remove"], [data-testid="posting_attachment_video_item_remove"]').first();
+      if (!await remove.count()) throw new Error('В восстановленном черновике не найдена кнопка удаления вложения');
+      await remove.click();
+      await page.waitForFunction(
+        count => document.querySelectorAll('[role="dialog"] [data-testid="posting_attachment_item"]').length === count,
+        remaining - 1,
+        { timeout: 5000 }
+      );
+    }
+    await editor.fill('');
+  }
   const input = dialog.locator('input[type="file"]').first();
   if (!await input.count()) throw new Error('В диалоге нового поста нет файлового input');
   for (let index = 0; index < plan.media.length; index += 1) {
-    await input.setInputFiles(plan.media[index]);
-    await page.waitForFunction(
-      expected => document.querySelectorAll('[role="dialog"] [data-testid="posting_attachment_item"]').length === expected,
-      index + 1,
-      { timeout: 30000 }
-    );
+    const expected = index + 1;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      await input.setInputFiles(plan.media[index]);
+      try {
+        await page.waitForFunction(
+          count => document.querySelectorAll('[role="dialog"] [data-testid="posting_attachment_item"]').length === count,
+          expected,
+          { timeout: 30000 }
+        );
+        break;
+      } catch (error) {
+        const actual = await dialog.locator('[data-testid="posting_attachment_item"]').count();
+        if (actual === expected) break;
+        if (actual !== index || attempt === 1) {
+          throw new Error(`Фото ${index + 1} не загрузилось: ожидалось вложений ${expected}, найдено ${actual}`);
+        }
+        // The count proves that VK did not add this file, so one retry cannot create a duplicate.
+      }
+    }
   }
   await page.waitForTimeout(1500);
   const count = await dialog.locator('[data-testid="posting_attachment_item"]').count();
   if (count !== plan.expectedCount) throw new Error(`Ожидалось вложений: ${plan.expectedCount}, получено: ${count}`);
 
-  const editor = dialog.locator('[data-testid="posting_base_screen_input_message"]');
-  if (!await editor.count()) throw new Error('Редактор текста в диалоге не найден');
   await editor.fill(plan.text);
   const actual = await editorText(editor);
   const expected = normalizeNewlines(plan.text);
@@ -184,22 +229,33 @@ async function verifyPreparedForm(page, plan) {
 }
 
 async function clickPublishOnce(page, plan, beforeSubmit) {
-  const dialog = await verifyPreparedForm(page, plan);
-  await dialog.getByText('Далее', { exact: true }).click();
-  const settings = page.locator('[role="dialog"]').filter({ hasText: 'Настройки' }).first();
-  await settings.waitFor({ state: 'visible', timeout: 10000 });
+  let settings = settingsDialog(page);
+  const settingsCount = await settings.count();
+  if (!settingsCount) {
+    const settingsButtonCount = await page.locator('[data-testid="posting_suggest_button"], [data-testid="posting_publish_button"]').count();
+    if (settingsButtonCount) throw new Error(`Кнопка отправки найдена вне ожидаемого диалога (кнопок: ${settingsButtonCount})`);
+    const dialog = await verifyPreparedForm(page, plan);
+    await dialog.getByText('Далее', { exact: true }).click();
+    settings = settingsDialog(page);
+    await settings.waitFor({ state: 'visible', timeout: 10000 });
+  }
   const previewText = await renderedText(settings);
   if (!canonicalRenderedText(previewText).includes(canonicalRenderedText(plan.text))) {
     throw new Error('Текст превью на экране настроек не совпадает с advertisement.md');
   }
-  const previewCount = await settings.locator('[data-testid="posting_attachment_item"]').count();
-  if (previewCount !== plan.expectedCount) throw new Error(`В превью ожидалось вложений: ${plan.expectedCount}, найдено: ${previewCount}`);
+  const previewCount = await settings.locator('[data-testid="posting_preview_attachment_item"]').count();
+  if (previewCount !== plan.expectedCount) {
+    const html = await settings.innerHTML();
+    fs.writeFileSync(path.join(os.tmpdir(), 'animal-volunteer-settings-debug.html'), html, 'utf8');
+    throw new Error(`В превью ожидалось вложений: ${plan.expectedCount}, найдено: ${previewCount}`);
+  }
   if (await settings.locator('input:checked, [aria-checked="true"]').count()) throw new Error('На экране настроек включена дополнительная опция');
-  const publish = settings.getByRole('button', { name: /^(Опубликовать|Предложить)$/ });
+  const publish = settings.getByRole('button', { name: /^(Опубликовать|Предложить(?: пост| новость)?)$/ });
   if (await publish.count() !== 1) throw new Error('Не найдена единственная кнопка отправки');
   await beforeSubmit();
   await publish.click();
-  await settings.waitFor({ state: 'hidden', timeout: 30000 });
+  const dialogClosed = await settings.waitFor({ state: 'hidden', timeout: 30000 }).then(() => true, () => false);
+  return { dialogClosed };
 }
 
 async function renderedText(locator) {
@@ -219,7 +275,10 @@ async function renderedText(locator) {
 }
 
 function canonicalRenderedText(value) {
-  return normalizeNewlines(value).replace(/\n{2,}/g, '\n\n').replace(/\n$/, '');
+  return normalizeNewlines(value)
+    .replace(/\nПоказать ещё$/, '')
+    .replace(/\n{2,}/g, '\n\n')
+    .replace(/\n$/, '');
 }
 
 async function visiblePostIds(page) {
@@ -256,14 +315,18 @@ async function findResult(page, plan, { excludedPostIds = [], expectedOwnerId } 
   if (!result) {
     const suggested = page.getByText(/Предложенные\s+\d+/).first();
     const href = await suggested.getAttribute('href').catch(() => null);
-    if (href) {
-      await page.goto(new URL(href, page.url()).href, { waitUntil: 'domcontentloaded' });
+    const suggestedUrl = href
+      ? new URL(href, page.url()).href
+      : expectedOwnerId ? `https://vk.ru/wall${expectedOwnerId}?suggested=1` : null;
+    if (suggestedUrl) {
+      await page.goto(suggestedUrl, { waitUntil: 'domcontentloaded' });
       await page.waitForTimeout(3000);
       result = await inspect();
       if (result) {
         return {
           type: 'suggested',
-          url: page.url(),
+          url: `https://vk.ru/wall${result.postId}`,
+          suggestedUrl: page.url(),
           attachmentCount: result.attachmentCount
         };
       }
@@ -279,6 +342,7 @@ async function findResult(page, plan, { excludedPostIds = [], expectedOwnerId } 
 
 module.exports = {
   authorizationStatus,
+  canonicalRenderedText,
   clickPublishOnce,
   ensureSession,
   fillPostingDialog,
