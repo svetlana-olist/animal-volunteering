@@ -282,6 +282,7 @@ async function renderedText(locator) {
 
 function canonicalRenderedText(value) {
   return normalizeNewlines(value)
+    .replace(/https?:\/\/(?:www\.)?/gi, '')
     .replace(/\nПоказать ещё$/, '')
     .replace(/\n{2,}/g, '\n\n')
     .replace(/\n$/, '');
