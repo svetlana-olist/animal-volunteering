@@ -4,13 +4,14 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
-const { createPostingPlan, hashPlan } = require('./lib/posting-plan');
+const { createPostingPlan, hashPlan, loadKnownAdvertisements } = require('./lib/posting-plan');
 const {
   authorizationStatus,
   clickPublishOnce,
   ensureSession,
   fillPostingDialog,
   findResult,
+  inspectSuggestedPosts,
   selectGroupPage,
   visiblePostIds
 } = require('./lib/vk-browser');
@@ -99,6 +100,29 @@ function print(value) {
   process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
 }
 
+async function checkSuggestedPosts(context, state) {
+  if (!state.expectedOwnerId) throw new Error('Не определён owner ID выбранной группы');
+  const suggestedUrl = state.suggestedHref || `https://vk.ru/wall${state.expectedOwnerId}?suggested=1`;
+  const suggestedPage = await context.newPage();
+  try {
+    await suggestedPage.goto(suggestedUrl, { waitUntil: 'domcontentloaded' });
+    await suggestedPage.waitForTimeout(2000);
+    const result = await inspectSuggestedPosts(suggestedPage, loadKnownAdvertisements(root), {
+      expectedCount: state.expectedSuggestedCount ?? null
+    });
+    state.suggestedHref = suggestedPage.url();
+    state.suggestedPostIds = result.postIds;
+    if (result.duplicate) {
+      throw new Error(`В предложенных уже есть наше объявление (${result.duplicate.animal}, ${result.duplicate.postId || 'без ID'}). Публикация в эту группу запрещена`);
+    }
+    if (!result.complete) {
+      throw new Error(`Не удалось проверить всю предложку: найдено ${result.postIds.length} из ${state.expectedSuggestedCount} записей. Публикация запрещена`);
+    }
+  } finally {
+    await suggestedPage.close();
+  }
+}
+
 async function withSession(action) {
   const session = await ensureSession(root);
   try {
@@ -140,7 +164,7 @@ async function openGroup() {
   const state = loadState();
   const plan = checkedPlan(state);
   if (!['prepared', 'group_checked'].includes(state.stage)) throw new Error(`Команда недоступна в состоянии ${state.stage}`);
-  await withSession(async ({ page }) => {
+  await withSession(async ({ context, page }) => {
     const auth = await authorizationStatus(page);
     if (!auth.authorized) throw new Error('Сначала войдите в VK в открытом Edge и повторите session');
     await page.goto(plan.group.url, { waitUntil: 'domcontentloaded' });
@@ -151,8 +175,10 @@ async function openGroup() {
     const body = await page.locator('body').innerText();
     if (!/Создать|Предложить пост|Предложить новость/.test(body)) throw new Error('В группе нет доступного способа создать запись');
     const suggested = page.getByText(/Предложенные\s+\d+/).first();
+    const suggestedLabel = await suggested.innerText().catch(() => '');
     const suggestedHref = await suggested.getAttribute('href').catch(() => null);
     state.suggestedHref = suggestedHref ? new URL(suggestedHref, page.url()).href : null;
+    state.expectedSuggestedCount = suggestedLabel ? Number.parseInt(suggestedLabel.match(/\d+/)?.[0], 10) : null;
     const visibleIds = await visiblePostIds(page);
     const owners = visibleIds.map(id => id.split('_')[0]).filter(owner => /^-\d+$/.test(owner));
     const counts = new Map(owners.map(owner => [owner, owners.filter(value => value === owner).length]));
@@ -163,19 +189,9 @@ async function openGroup() {
     else {
       throw new Error('Не удалось однозначно определить owner ID выбранной группы');
     }
-    state.suggestedPostIds = [];
-    if (suggestedHref) {
-      const suggestedPage = await context.newPage();
-      try {
-        await suggestedPage.goto(state.suggestedHref, { waitUntil: 'domcontentloaded' });
-        await suggestedPage.waitForTimeout(2000);
-        state.suggestedPostIds = await visiblePostIds(suggestedPage);
-      } finally {
-        await suggestedPage.close();
-      }
-    }
+    await checkSuggestedPosts(context, state);
     transition(state, ['prepared', 'group_checked'], 'group_checked');
-    print({ stage: state.stage, title, url: page.url(), suggestedHref, next: suggestedHref ? 'Проверьте предложенные, затем fill --suggested-reviewed' : 'Выполните fill --suggested-reviewed' });
+    print({ stage: state.stage, title, url: page.url(), suggestedHref: state.suggestedHref, next: 'Проверьте предложенные, затем fill --suggested-reviewed' });
   });
 }
 
@@ -188,6 +204,7 @@ async function fill(args) {
     const page = await selectGroupPage(context, plan);
     const auth = await authorizationStatus(page);
     if (!auth.authorized) throw new Error('Авторизация VK не подтверждена');
+    await checkSuggestedPosts(context, state);
     const result = await fillPostingDialog(page, plan);
     state.reviewToken = crypto.randomBytes(6).toString('hex');
     transition(state, ['group_checked', 'form_verified'], 'form_verified');
@@ -267,16 +284,7 @@ async function publish(args) {
     const page = await selectGroupPage(context, plan, { requireDialog: true });
     const beforePostIds = await visiblePostIds(page);
     state.beforePostIds = beforePostIds;
-    if (state.suggestedHref) {
-      const suggestedPage = await context.newPage();
-      try {
-        await suggestedPage.goto(state.suggestedHref, { waitUntil: 'domcontentloaded' });
-        await suggestedPage.waitForTimeout(2000);
-        state.suggestedPostIds = await visiblePostIds(suggestedPage);
-      } finally {
-        await suggestedPage.close();
-      }
-    }
+    await checkSuggestedPosts(context, state);
     const submission = await clickPublishOnce(page, plan, async () => transition(state, ['form_verified'], 'submit_attempted'));
     const result = await findResult(page, plan, {
       excludedPostIds: [...beforePostIds, ...(state.suggestedPostIds || [])],

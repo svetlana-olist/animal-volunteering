@@ -6,6 +6,7 @@ const path = require('path');
 const {
   GROUP_INTERVAL_MS,
   createPostingPlan,
+  loadKnownAdvertisements,
   normalizeVkUrl,
   parseGroups,
   parseReport
@@ -51,6 +52,14 @@ test('requires an explicit visual media review assertion', () => {
     () => createPostingPlan({ root, animal: 'Марта', groupUrl: 'https://vk.ru/help_animals' }),
     /визуально проверьте/
   );
+});
+
+test('loads advertisements from active animal cards only', () => {
+  const { root } = fixture();
+  const archived = path.join(root, 'animals', 'dogs', 'archive', 'Старая карточка');
+  fs.mkdirSync(archived, { recursive: true });
+  fs.writeFileSync(path.join(archived, 'advertisement.md'), 'Старое объявление');
+  assert.deepEqual(loadKnownAdvertisements(root), [{ animal: 'Марта', text: 'Марта ищет дом\n' }]);
 });
 
 test('rejects a media file with another prefix', () => {

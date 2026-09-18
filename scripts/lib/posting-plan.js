@@ -65,6 +65,22 @@ function readRequired(file, label) {
   return value;
 }
 
+function loadKnownAdvertisements(root) {
+  const advertisements = [];
+  for (const species of ['dogs', 'cats']) {
+    const speciesDir = path.join(root, 'animals', species);
+    if (!fs.existsSync(speciesDir)) continue;
+    for (const entry of fs.readdirSync(speciesDir, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      const advertisementPath = path.join(speciesDir, entry.name, 'advertisement.md');
+      if (!fs.existsSync(advertisementPath)) continue;
+      const text = fs.readFileSync(advertisementPath, 'utf8');
+      if (text.trim()) advertisements.push({ animal: entry.name, text });
+    }
+  }
+  return advertisements;
+}
+
 function assertGroupEligibility({ animal, species, group, records, now }) {
   if (/платно|пропустить/i.test(group.name)) throw new Error(`Группа помечена как платная или пропускаемая: ${group.name}`);
   if (species === 'dogs' && /кошк|котят/i.test(group.name) && !/собак/i.test(group.name)) {
@@ -150,6 +166,7 @@ module.exports = {
   GROUP_INTERVAL_MS,
   createPostingPlan,
   hashPlan,
+  loadKnownAdvertisements,
   normalizeVkUrl,
   parseGroups,
   parseReport

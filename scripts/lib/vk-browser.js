@@ -284,6 +284,38 @@ function canonicalRenderedText(value) {
     .replace(/\n$/, '');
 }
 
+function matchKnownAdvertisement(value, advertisements) {
+  const rendered = canonicalRenderedText(value);
+  return advertisements.find(item => canonicalRenderedText(item.text) === rendered) || null;
+}
+
+async function inspectSuggestedPosts(page, advertisements, { expectedCount = null } = {}) {
+  const postIds = new Set();
+  let stableRounds = 0;
+  for (let attempt = 0; attempt < 20 && stableRounds < 2; attempt += 1) {
+    const sizeBefore = postIds.size;
+    const posts = page.locator('[data-testid="post"]');
+    for (let index = 0; index < await posts.count(); index += 1) {
+      const post = posts.nth(index);
+      const postId = await post.getAttribute('data-post-id');
+      if (postId) postIds.add(postId);
+      const textLocator = post.locator('[data-testid="post_text"]');
+      if (!await textLocator.count()) continue;
+      const match = matchKnownAdvertisement(await renderedText(textLocator), advertisements);
+      if (match) return { postIds: [...postIds], duplicate: { animal: match.animal, postId }, complete: true };
+    }
+    stableRounds = postIds.size === sizeBefore ? stableRounds + 1 : 0;
+    if (expectedCount !== null && postIds.size >= expectedCount) break;
+    await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+    await page.waitForTimeout(750);
+  }
+  return {
+    postIds: [...postIds],
+    duplicate: null,
+    complete: expectedCount === null || postIds.size >= expectedCount
+  };
+}
+
 async function visiblePostIds(page) {
   return page.locator('[data-testid="post"]').evaluateAll(posts => posts.map(post => post.getAttribute('data-post-id')).filter(Boolean));
 }
@@ -350,6 +382,8 @@ module.exports = {
   ensureSession,
   fillPostingDialog,
   findResult,
+  inspectSuggestedPosts,
+  matchKnownAdvertisement,
   newPostDialog,
   normalizeNewlines,
   selectGroupPage,
