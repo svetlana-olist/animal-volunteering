@@ -1,0 +1,15 @@
+{
+  "name": "animal-volunteer",
+  "private": true,
+  "type": "commonjs",
+  "scripts": {
+    "test": "node --test",
+    "vk": "node scripts/vk-post.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "playwright": "^1.63.0"
+  }
+}
