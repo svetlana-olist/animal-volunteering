@@ -13,6 +13,7 @@ const {
   findResult,
   inspectSuggestedPosts,
   selectGroupPage,
+  verifyResultUrl,
   visiblePostIds
 } = require('./lib/vk-browser');
 
@@ -168,7 +169,11 @@ async function openGroup() {
     const auth = await authorizationStatus(page);
     if (!auth.authorized) throw new Error('Сначала войдите в VK в открытом Edge и повторите session');
     await page.goto(plan.group.url, { waitUntil: 'domcontentloaded' });
-    await page.waitForTimeout(2500);
+    await page.waitForFunction(
+      () => /Создать|Предложить пост|Предложить новость/.test(document.body?.innerText || ''),
+      null,
+      { timeout: 5000 }
+    ).catch(() => {});
     const actualKey = new URL(page.url()).pathname.replace(/\/$/, '').toLowerCase();
     if (actualKey !== plan.group.key) throw new Error(`VK перенаправил на другую страницу: ${page.url()}`);
     const title = await page.title();
@@ -231,7 +236,7 @@ async function inspectResult(args) {
         throw new Error('Диагностическая ссылка должна вести на запись выбранной группы');
       }
       await page.goto(target.href, { waitUntil: 'domcontentloaded' });
-      await page.waitForTimeout(3000);
+      await page.locator(`[data-testid="post"][data-post-id="${target.pathname.slice(5)}"]`).waitFor({ state: 'visible', timeout: 5000 }).catch(() => {});
       const posts = await inspectPage();
       let screenshot = null;
       const mediaScreenshots = [];
@@ -306,9 +311,23 @@ async function publish(args) {
   });
 }
 
-async function verify() {
+async function verify(args) {
   const state = loadState();
   const plan = checkedPlan(state, { eligibility: false });
+  if (state.stage === 'form_verified') {
+    if (!args.url) throw new Error('Для проверки ручной публикации укажите verify --url <ссылка на запись>');
+    await withSession(async ({ page }) => {
+      const result = await verifyResultUrl(page, plan, args.url, {
+        excludedPostIds: [...(state.beforePostIds || []), ...(state.suggestedPostIds || [])],
+        expectedOwnerId: state.expectedOwnerId
+      });
+      if (!result) throw new Error('Ручная публикация не совпадает с подготовленным текстом или составом вложений');
+      state.result = { ...result, verifiedAt: new Date().toISOString() };
+      transition(state, ['form_verified'], 'result_verified');
+      print({ stage: state.stage, verified: true, result: state.result });
+    });
+    return;
+  }
   if (!['submit_attempted', 'result_unknown', 'result_verified'].includes(state.stage)) {
     throw new Error(`Команда verify недоступна в состоянии ${state.stage}`);
   }
@@ -363,7 +382,7 @@ function status() {
 }
 
 function usage() {
-  process.stdout.write(`Команды:\n  prepare --animal <имя> --group-url <url> --media-reviewed [--replace]\n  session\n  open-group\n  fill --suggested-reviewed\n  publish --token <reviewToken>\n  verify\n  inspect-result [--url <post-url>] [--screenshot-all]\n  resolve-deleted --url <post-url>\n  status\n`);
+  process.stdout.write(`Команды:\n  prepare --animal <имя> --group-url <url> --media-reviewed [--replace]\n  session\n  open-group\n  fill --suggested-reviewed\n  publish --token <reviewToken>\n  verify [--url <post-url>]\n  inspect-result [--url <post-url>] [--screenshot-all]\n  resolve-deleted --url <post-url>\n  status\n`);
 }
 
 async function main() {
@@ -375,7 +394,7 @@ async function main() {
   if (command === 'fill') return withLock(() => fill(args));
   if (command === 'inspect-result') return inspectResult(args);
   if (command === 'publish') return withLock(() => publish(args));
-  if (command === 'verify') return withLock(() => verify());
+  if (command === 'verify') return withLock(() => verify(args));
   if (command === 'resolve-deleted') return withLock(() => resolveDeleted(args));
   if (command === 'status') return status();
   usage();

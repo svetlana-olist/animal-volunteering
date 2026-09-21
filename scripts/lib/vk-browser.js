@@ -32,7 +32,8 @@ async function ensureSession(root) {
   let token;
   let launched = false;
   let markerUrl;
-  if (!await cdpAvailable()) {
+  let available = await cdpAvailable();
+  if (!available) {
     launched = true;
     fs.mkdirSync(profile, { recursive: true });
     token = crypto.randomBytes(24).toString('hex');
@@ -47,10 +48,11 @@ async function ensureSession(root) {
     child.unref();
     for (let attempt = 0; attempt < 20; attempt += 1) {
       await new Promise(resolve => setTimeout(resolve, 500));
-      if (await cdpAvailable()) break;
+      available = await cdpAvailable();
+      if (available) break;
     }
   }
-  if (!await cdpAvailable()) throw new Error('Не удалось запустить Edge с CDP на порту 9222');
+  if (!available) throw new Error('Не удалось запустить Edge с CDP на порту 9222');
 
   if (!token) {
     if (!fs.existsSync(tokenPath)) throw new Error('Порт 9222 занят браузером, запущенным не этой CLI');
@@ -82,11 +84,16 @@ async function ensureSession(root) {
 }
 
 async function authorizationStatus(page) {
+  const inspect = async () => {
+    const body = await page.locator('body').innerText().catch(() => '');
+    const loginInputs = await page.locator('input[name="email"], input[name="login"], input[type="password"]').count();
+    const profileEvidence = /Настройки профиля/.test(body);
+    return { authorized: loginInputs === 0 && profileEvidence, loginInputs, profileEvidence, url: page.url() };
+  };
+  const immediate = await inspect();
+  if (immediate.authorized || immediate.loginInputs) return immediate;
   await page.waitForTimeout(1000);
-  const body = await page.locator('body').innerText().catch(() => '');
-  const loginInputs = await page.locator('input[name="email"], input[name="login"], input[type="password"]').count();
-  const profileEvidence = /Настройки профиля/.test(body);
-  return { authorized: loginInputs === 0 && profileEvidence, loginInputs, profileEvidence, url: page.url() };
+  return inspect();
 }
 
 async function selectGroupPage(context, plan, { requireDialog = false } = {}) {
@@ -288,6 +295,32 @@ function canonicalRenderedText(value) {
     .replace(/\n$/, '');
 }
 
+function parseResultUrl(value, expectedOwnerId) {
+  let target;
+  try {
+    target = new URL(value);
+  } catch {
+    throw new Error('Ссылка результата некорректна');
+  }
+  if (!/^https?:$/.test(target.protocol)
+      || !/^(?:www\.)?vk\.(?:com|ru)$/i.test(target.hostname)
+      || target.username
+      || target.password
+      || target.port
+      || target.search
+      || target.hash) {
+    throw new Error('Ссылка результата должна вести на запись VK');
+  }
+  const match = target.pathname.match(/^\/wall(-\d+)_(\d+)$/);
+  if (!match) throw new Error('Ссылка результата должна вести на отдельную запись VK');
+  const ownerId = match[1];
+  if (expectedOwnerId && ownerId !== expectedOwnerId) {
+    throw new Error('Ссылка результата ведёт на запись другой группы');
+  }
+  const postId = `${ownerId}_${match[2]}`;
+  return { ownerId, postId, url: `https://vk.ru/wall${postId}` };
+}
+
 function countPreviewAttachments(previewItems, primaryVideos, nestedPrimaryVideos) {
   return previewItems + Math.max(0, primaryVideos - nestedPrimaryVideos);
 }
@@ -314,6 +347,7 @@ async function inspectSuggestedPosts(page, advertisements, { expectedCount = nul
     }
     stableRounds = postIds.size === sizeBefore ? stableRounds + 1 : 0;
     if (expectedCount !== null && postIds.size >= expectedCount) break;
+    if (stableRounds >= 2) break;
     await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
     await page.waitForTimeout(750);
   }
@@ -328,29 +362,51 @@ async function visiblePostIds(page) {
   return page.locator('[data-testid="post"]').evaluateAll(posts => posts.map(post => post.getAttribute('data-post-id')).filter(Boolean));
 }
 
-async function findResult(page, plan, { excludedPostIds = [], expectedOwnerId } = {}) {
-  await page.waitForTimeout(3000);
-  const inspect = async () => {
-    const posts = page.locator('[data-testid="post"]');
-    for (let index = 0; index < await posts.count(); index += 1) {
-      const post = posts.nth(index);
-      const postId = await post.getAttribute('data-post-id');
-      if (!postId || excludedPostIds.includes(postId)) continue;
-      const ownerId = postId.split('_')[0];
-      if (!expectedOwnerId || ownerId !== expectedOwnerId) continue;
-      const textLocator = post.locator('[data-testid="post_text"]');
-      if (!await textLocator.count()) continue;
-      const text = await renderedText(textLocator);
-      if (canonicalRenderedText(text) !== canonicalRenderedText(plan.text)) continue;
-      const attachmentCount = await post.locator('a').evaluateAll(elements => {
-        const links = elements.map(element => element.getAttribute('href') || '');
-        return new Set(links.filter(link => link.includes('/photo') || link.includes('/video'))).size;
-      });
-      if (attachmentCount !== plan.expectedCount) continue;
-      return { postId, attachmentCount };
-    }
-    return null;
+async function findMatchingPost(page, plan, { excludedPostIds = [], expectedOwnerId, targetPostId = null } = {}) {
+  const posts = targetPostId
+    ? page.locator(`[data-testid="post"][data-post-id="${targetPostId}"]`)
+    : page.locator('[data-testid="post"]');
+  for (let index = 0; index < await posts.count(); index += 1) {
+    const post = posts.nth(index);
+    const postId = await post.getAttribute('data-post-id');
+    if (!postId || excludedPostIds.includes(postId)) continue;
+    const ownerId = postId.split('_')[0];
+    if (expectedOwnerId && ownerId !== expectedOwnerId) continue;
+    const textLocator = post.locator('[data-testid="post_text"]');
+    if (!await textLocator.count()) continue;
+    const text = await renderedText(textLocator);
+    if (canonicalRenderedText(text) !== canonicalRenderedText(plan.text)) continue;
+    const attachmentCount = await post.locator('a').evaluateAll(elements => {
+      const links = elements.map(element => element.getAttribute('href') || '');
+      return new Set(links.filter(link => link.includes('/photo') || link.includes('/video'))).size;
+    });
+    if (attachmentCount !== plan.expectedCount) continue;
+    return { postId, attachmentCount };
+  }
+  return null;
+}
+
+async function verifyResultUrl(page, plan, value, { excludedPostIds = [], expectedOwnerId } = {}) {
+  const target = parseResultUrl(value, expectedOwnerId);
+  await page.goto(target.url, { waitUntil: 'domcontentloaded' });
+  await page.locator(`[data-testid="post"][data-post-id="${target.postId}"]`).waitFor({ state: 'visible', timeout: 5000 }).catch(() => {});
+  const result = await findMatchingPost(page, plan, {
+    excludedPostIds,
+    expectedOwnerId,
+    targetPostId: target.postId
+  });
+  if (!result) return null;
+  return {
+    type: 'published',
+    source: 'manual',
+    url: target.url,
+    postId: result.postId,
+    attachmentCount: result.attachmentCount
   };
+}
+
+async function findResult(page, plan, { excludedPostIds = [], expectedOwnerId } = {}) {
+  const inspect = () => findMatchingPost(page, plan, { excludedPostIds, expectedOwnerId });
 
   await page.goto(plan.group.url, { waitUntil: 'domcontentloaded' });
   await page.waitForTimeout(3000);
@@ -395,7 +451,9 @@ module.exports = {
   matchKnownAdvertisement,
   newPostDialog,
   normalizeNewlines,
+  parseResultUrl,
   selectGroupPage,
+  verifyResultUrl,
   visiblePostIds,
   verifyPreparedForm
 };
