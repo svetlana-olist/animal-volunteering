@@ -83,6 +83,7 @@ function loadKnownAdvertisements(root) {
 
 function assertGroupEligibility({ animal, species, group, records, now }) {
   if (/платно|пропустить/i.test(group.name)) throw new Error(`Группа помечена как платная или пропускаемая: ${group.name}`);
+  if (/^\/topic-/i.test(group.key)) throw new Error(`Ссылка ведёт на обсуждение, а не на стену группы: ${group.name}`);
   if (species === 'dogs' && /кошк|котят/i.test(group.name) && !/собак/i.test(group.name)) {
     throw new Error(`Группа предназначена только для кошек: ${group.name}`);
   }
@@ -99,6 +100,20 @@ function assertGroupEligibility({ animal, species, group, records, now }) {
   if (sameAnimal && now - sameAnimal.timestamp < ANIMAL_INTERVAL_MS) {
     throw new Error(`Для ${animal} в этой группе еще не прошли 7 дней`);
   }
+}
+
+function eligibleGroups({ root, animal, now = Date.now() }) {
+  const found = findAnimal(root, animal);
+  const groups = parseGroups(readRequired(path.join(root, 'VkGroups.md'), 'VkGroups.md'));
+  const records = parseReport(readRequired(path.join(root, 'REPORT.MD'), 'REPORT.MD'));
+  return groups.filter(group => {
+    try {
+      assertGroupEligibility({ animal, species: found.species, group, records, now });
+      return true;
+    } catch {
+      return false;
+    }
+  });
 }
 
 function hashPlan(plan) {
@@ -165,6 +180,7 @@ module.exports = {
   ANIMAL_INTERVAL_MS,
   GROUP_INTERVAL_MS,
   createPostingPlan,
+  eligibleGroups,
   hashPlan,
   loadKnownAdvertisements,
   normalizeVkUrl,

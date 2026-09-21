@@ -4,7 +4,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
-const { createPostingPlan, hashPlan, loadKnownAdvertisements } = require('./lib/posting-plan');
+const { createPostingPlan, eligibleGroups, hashPlan, loadKnownAdvertisements } = require('./lib/posting-plan');
 const {
   authorizationStatus,
   clickPublishOnce,
@@ -151,6 +151,17 @@ async function prepare(args) {
   const state = { version: 1, stage: 'prepared', plan };
   saveState(state);
   print({ stage: state.stage, animal: plan.animal, group: plan.group, media: plan.media, expectedCount: plan.expectedCount });
+}
+
+function candidates(args) {
+  if (!args.animal) throw new Error('Укажите --animal');
+  const groups = eligibleGroups({ root, animal: args.animal });
+  for (let index = groups.length - 1; index > 0; index -= 1) {
+    const swapIndex = crypto.randomInt(index + 1);
+    [groups[index], groups[swapIndex]] = [groups[swapIndex], groups[index]];
+  }
+  const limit = args.all ? groups.length : 1;
+  print({ animal: args.animal, eligibleCount: groups.length, groups: groups.slice(0, limit) });
 }
 
 async function sessionCommand() {
@@ -382,12 +393,13 @@ function status() {
 }
 
 function usage() {
-  process.stdout.write(`Команды:\n  prepare --animal <имя> --group-url <url> --media-reviewed [--replace]\n  session\n  open-group\n  fill --suggested-reviewed\n  publish --token <reviewToken>\n  verify [--url <post-url>]\n  inspect-result [--url <post-url>] [--screenshot-all]\n  resolve-deleted --url <post-url>\n  status\n`);
+  process.stdout.write(`Команды:\n  candidates --animal <имя> [--all]\n  prepare --animal <имя> --group-url <url> --media-reviewed [--replace]\n  session\n  open-group\n  fill --suggested-reviewed\n  publish --token <reviewToken>\n  verify [--url <post-url>]\n  inspect-result [--url <post-url>] [--screenshot-all]\n  resolve-deleted --url <post-url>\n  status\n`);
 }
 
 async function main() {
   const args = argsFrom(process.argv.slice(2));
   const command = args._[0];
+  if (command === 'candidates') return candidates(args);
   if (command === 'prepare') return withLock(() => prepare(args));
   if (command === 'session') return sessionCommand();
   if (command === 'open-group') return withLock(() => openGroup());

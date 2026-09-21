@@ -139,8 +139,8 @@ async function openPostingDialog(page) {
     if (await locator.count()) {
       await locator.click();
       if (label === 'Создать') {
-        await page.waitForTimeout(500);
         const post = page.getByText('Пост', { exact: true }).filter({ visible: true }).first();
+        await post.waitFor({ state: 'visible', timeout: 5000 }).catch(() => {});
         if (await post.count()) await post.click();
       }
       try {

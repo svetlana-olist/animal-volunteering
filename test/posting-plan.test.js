@@ -6,6 +6,7 @@ const path = require('path');
 const {
   GROUP_INTERVAL_MS,
   createPostingPlan,
+  eligibleGroups,
   loadKnownAdvertisements,
   normalizeVkUrl,
   parseGroups,
@@ -117,5 +118,30 @@ test('rejects paid groups', () => {
   assert.throws(
     () => createPostingPlan({ root, animal: 'Марта', groupUrl: 'https://vk.com/paid_group', mediaReviewed: true }),
     /платная/
+  );
+});
+
+test('lists only groups currently eligible for an animal', () => {
+  const { root } = fixture();
+  fs.appendFileSync(
+    path.join(root, 'VkGroups.md'),
+    '2. Платная группа ПЛАТНО\n   https://vk.com/paid_group\n3. Другая группа\n   https://vk.com/other_group\n'
+  );
+  fs.writeFileSync(
+    path.join(root, 'REPORT.MD'),
+    '# Отчёт\n\n## 2026-09-18\n\n- 10:00 МСК — Ириска — [Помощь](https://vk.com/help_animals) — запись;\n'
+  );
+  assert.deepEqual(
+    eligibleGroups({ root, animal: 'Марта', now: Date.parse('2026-09-18T10:01:00+03:00') }).map(group => group.key),
+    ['/other_group']
+  );
+});
+
+test('rejects a discussion topic instead of a group wall', () => {
+  const { root } = fixture();
+  fs.writeFileSync(path.join(root, 'VkGroups.md'), '1. Обсуждение\n   https://vk.com/topic-1_2\n');
+  assert.throws(
+    () => createPostingPlan({ root, animal: 'Марта', groupUrl: 'https://vk.com/topic-1_2', mediaReviewed: true }),
+    /обсуждение/
   );
 });
