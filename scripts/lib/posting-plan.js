@@ -50,8 +50,9 @@ function parseReport(markdown) {
   return records;
 }
 
-function findAnimal(root, animal) {
-  const matches = ['dogs', 'cats']
+function findAnimal(root, animal, species) {
+  if (species && !['dogs', 'cats'].includes(species)) throw new Error('Вид животного должен быть dogs или cats');
+  const matches = (species ? [species] : ['dogs', 'cats'])
     .map(species => ({ species, dir: path.join(root, 'animals', species, animal) }))
     .filter(item => fs.existsSync(item.dir) && fs.statSync(item.dir).isDirectory());
   if (matches.length !== 1) throw new Error(`Животное ${animal} должно находиться ровно в одной папке dogs или cats`);
@@ -102,8 +103,8 @@ function assertGroupEligibility({ animal, species, group, records, now }) {
   }
 }
 
-function eligibleGroups({ root, animal, now = Date.now() }) {
-  const found = findAnimal(root, animal);
+function eligibleGroups({ root, animal, species, now = Date.now() }) {
+  const found = findAnimal(root, animal, species);
   const groups = parseGroups(readRequired(path.join(root, 'VkGroups.md'), 'VkGroups.md'));
   const records = parseReport(readRequired(path.join(root, 'REPORT.MD'), 'REPORT.MD'));
   return groups.filter(group => {
@@ -129,11 +130,11 @@ function hashPlan(plan) {
   return hash.digest('hex');
 }
 
-function createPostingPlan({ root, animal, groupUrl, mediaReviewed = false, now = Date.now() }) {
+function createPostingPlan({ root, animal, species, groupUrl, mediaReviewed = false, now = Date.now() }) {
   if (!animal || !groupUrl) throw new Error('Нужны параметры --animal и --group-url');
   if (!mediaReviewed) throw new Error('Сначала визуально проверьте все медиа, затем добавьте --media-reviewed');
 
-  const found = findAnimal(root, animal);
+  const found = findAnimal(root, animal, species);
   const infoPath = path.join(found.dir, 'info.md');
   const advertisementPath = path.join(found.dir, 'advertisement.md');
   const info = readRequired(infoPath, 'info.md');

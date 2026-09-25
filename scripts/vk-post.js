@@ -51,7 +51,7 @@ function loadState() {
 function checkedPlan(state, { eligibility = true } = {}) {
   const plan = state.plan;
   const currentHash = eligibility
-    ? createPostingPlan({ root, animal: plan.animal, groupUrl: plan.group.url, mediaReviewed: true }).hash
+    ? createPostingPlan({ root, animal: plan.animal, species: plan.species, groupUrl: plan.group.url, mediaReviewed: true }).hash
     : hashPlan(plan);
   if (currentHash !== plan.hash) throw new Error('Файлы карточки изменились после prepare; создайте план заново');
   return plan;
@@ -146,6 +146,7 @@ async function prepare(args) {
   const plan = createPostingPlan({
     root,
     animal: args.animal,
+    species: args.species,
     groupUrl: args['group-url'],
     mediaReviewed: args['media-reviewed'] === true
   });
@@ -156,7 +157,7 @@ async function prepare(args) {
 
 function candidates(args) {
   if (!args.animal) throw new Error('Укажите --animal');
-  const groups = eligibleGroups({ root, animal: args.animal });
+  const groups = eligibleGroups({ root, animal: args.animal, species: args.species });
   for (let index = groups.length - 1; index > 0; index -= 1) {
     const swapIndex = crypto.randomInt(index + 1);
     [groups[index], groups[swapIndex]] = [groups[swapIndex], groups[index]];
@@ -400,7 +401,7 @@ function status() {
 }
 
 function usage() {
-  process.stdout.write(`Команды:\n  candidates --animal <имя> [--all]\n  prepare --animal <имя> --group-url <url> --media-reviewed [--replace]\n  session\n  open-group\n  fill --suggested-reviewed\n  publish --token <reviewToken>\n  verify [--url <post-url>]\n  inspect-result [--url <post-url>] [--screenshot-all]\n  resolve-deleted --url <post-url>\n  status\n`);
+  process.stdout.write(`Команды:\n  candidates --animal <имя> [--species dogs|cats] [--all]\n  prepare --animal <имя> [--species dogs|cats] --group-url <url> --media-reviewed [--replace]\n  session\n  open-group\n  fill --suggested-reviewed\n  publish --token <reviewToken>\n  verify [--url <post-url>]\n  inspect-result [--url <post-url>] [--screenshot-all]\n  resolve-deleted --url <post-url>\n  status\n`);
 }
 
 async function main() {

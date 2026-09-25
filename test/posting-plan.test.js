@@ -47,6 +47,29 @@ test('creates an immutable validated plan', () => {
   assert.ok(Object.isFrozen(plan));
 });
 
+test('uses an explicit species when an animal name exists in dogs and cats', () => {
+  const { root } = fixture();
+  const catDir = path.join(root, 'animals', 'cats', 'Марта');
+  fs.mkdirSync(catDir, { recursive: true });
+  fs.writeFileSync(path.join(catDir, 'info.md'), '# Марта\n\nРыжая кошка.\n');
+  fs.writeFileSync(path.join(catDir, 'advertisement.md'), 'Кошка Марта ищет дом\n');
+  fs.writeFileSync(path.join(catDir, 'Марта-01.jpg'), 'cat image');
+
+  assert.throws(
+    () => createPostingPlan({ root, animal: 'Марта', groupUrl: 'https://vk.ru/help_animals', mediaReviewed: true }),
+    /ровно в одной папке/
+  );
+  const plan = createPostingPlan({
+    root,
+    animal: 'Марта',
+    species: 'dogs',
+    groupUrl: 'https://vk.ru/help_animals',
+    mediaReviewed: true
+  });
+  assert.equal(plan.species, 'dogs');
+  assert.equal(plan.text, 'Марта ищет дом\n');
+});
+
 test('requires an explicit visual media review assertion', () => {
   const { root } = fixture();
   assert.throws(
