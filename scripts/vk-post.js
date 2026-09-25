@@ -20,6 +20,7 @@ const {
 const root = path.resolve(__dirname, '..');
 const statePath = path.join(root, '.tmp-vk-post-state.json');
 const lockPath = path.join(root, '.tmp-vk-post.lock');
+const commandStartedAt = Date.now();
 
 function argsFrom(argv) {
   const args = { _: [] };
@@ -98,7 +99,7 @@ async function withLock(action) {
 }
 
 function print(value) {
-  process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
+  process.stdout.write(`${JSON.stringify({ ...value, elapsedMs: Date.now() - commandStartedAt }, null, 2)}\n`);
 }
 
 async function checkSuggestedPosts(context, state) {
@@ -262,12 +263,18 @@ async function inspectResult(args) {
           .filter(item => (item.href.includes('/photo') || item.href.includes('/video')) && item.src)
           .filter((item, index, items) => items.findIndex(candidate => candidate.href === item.href) === index)
           .map(item => item.src));
-        for (let index = 0; index < mediaSources.length; index += 1) {
-          await page.goto(mediaSources[index], { waitUntil: 'load' });
+        const screenshots = await Promise.all(mediaSources.map(async (source, index) => {
+          const mediaPage = await page.context().newPage();
           const mediaPath = path.join(os.tmpdir(), `animal-volunteer-media-${index + 1}.png`);
-          await page.screenshot({ path: mediaPath });
-          mediaScreenshots.push(mediaPath);
-        }
+          try {
+            await mediaPage.goto(source, { waitUntil: 'load' });
+            await mediaPage.screenshot({ path: mediaPath });
+            return mediaPath;
+          } finally {
+            await mediaPage.close();
+          }
+        }));
+        mediaScreenshots.push(...screenshots);
       }
       print({ stage: state.stage, url: target.href, posts, screenshot, mediaScreenshots });
       return;
