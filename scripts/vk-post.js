@@ -138,7 +138,7 @@ async function prepare(args) {
   if (fs.existsSync(statePath)) {
     const existing = loadState();
     if (['submit_attempted', 'result_unknown'].includes(existing.stage)) {
-      throw new Error('Предыдущая отправка не подтверждена. Разрешена только команда verify');
+      throw new Error('Предыдущая отправка не подтверждена. Используйте verify или resolve-confirmed после явного подтверждения пользователя');
     }
     if (!args.replace) throw new Error('План уже существует. Используйте его или добавьте --replace до новой отправки');
     if (existing.stage === 'form_verified') throw new Error('Сначала закройте заполненную форму; заменять проверенный план запрещено');
@@ -388,6 +388,21 @@ async function resolveDeleted(args) {
   });
 }
 
+function resolveConfirmed(args) {
+  const state = loadState();
+  const plan = checkedPlan(state, { eligibility: false });
+  if (state.stage !== 'result_unknown') throw new Error(`Команда resolve-confirmed недоступна в состоянии ${state.stage}`);
+  if (!args.animal || args.animal !== plan.animal) {
+    throw new Error(`Подтвердите животное явно: resolve-confirmed --animal "${plan.animal}"`);
+  }
+  state.result = {
+    type: 'user_confirmed',
+    confirmedAt: new Date().toISOString()
+  };
+  transition(state, ['result_unknown'], 'result_confirmed');
+  print({ stage: state.stage, result: state.result, next: 'Можно подготовить следующую группу с prepare --replace' });
+}
+
 function status() {
   const state = loadState();
   print({
@@ -401,7 +416,7 @@ function status() {
 }
 
 function usage() {
-  process.stdout.write(`Команды:\n  candidates --animal <имя> [--species dogs|cats] [--all]\n  prepare --animal <имя> [--species dogs|cats] --group-url <url> --media-reviewed [--replace]\n  session\n  open-group\n  fill --suggested-reviewed\n  publish --token <reviewToken>\n  verify [--url <post-url>]\n  inspect-result [--url <post-url>] [--screenshot-all]\n  resolve-deleted --url <post-url>\n  status\n`);
+  process.stdout.write(`Команды:\n  candidates --animal <имя> [--species dogs|cats] [--all]\n  prepare --animal <имя> [--species dogs|cats] --group-url <url> --media-reviewed [--replace]\n  session\n  open-group\n  fill --suggested-reviewed\n  publish --token <reviewToken>\n  verify [--url <post-url>]\n  inspect-result [--url <post-url>] [--screenshot-all]\n  resolve-confirmed --animal <имя>\n  resolve-deleted --url <post-url>\n  status\n`);
 }
 
 async function main() {
@@ -415,6 +430,7 @@ async function main() {
   if (command === 'inspect-result') return inspectResult(args);
   if (command === 'publish') return withLock(() => publish(args));
   if (command === 'verify') return withLock(() => verify(args));
+  if (command === 'resolve-confirmed') return withLock(() => resolveConfirmed(args));
   if (command === 'resolve-deleted') return withLock(() => resolveDeleted(args));
   if (command === 'status') return status();
   usage();
