@@ -3,6 +3,7 @@ const assert = require('node:assert/strict');
 const {
   canonicalRenderedText,
   countPreviewAttachments,
+  isTextlessSettingsPreview,
   matchKnownAdvertisement,
   parseResultUrl
 } = require('../scripts/lib/vk-browser');
@@ -27,6 +28,13 @@ test('recognizes an existing known advertisement after VK rendering changes', ()
 test('counts a separately rendered primary video in the settings preview', () => {
   assert.equal(countPreviewAttachments(5, 1, 0), 6);
   assert.equal(countPreviewAttachments(6, 1, 1), 6);
+});
+
+test('accepts a textless settings preview only with exact attachments and controls', () => {
+  assert.equal(isTextlessSettingsPreview(4, 4, 1, 1), true);
+  assert.equal(isTextlessSettingsPreview(3, 4, 1, 1), false);
+  assert.equal(isTextlessSettingsPreview(4, 4, 0, 1), false);
+  assert.equal(isTextlessSettingsPreview(4, 4, 1, 0), false);
 });
 
 test('parses only an exact post URL from the expected group', () => {

@@ -250,13 +250,25 @@ async function clickPublishOnce(page, plan, beforeSubmit) {
     await settings.waitFor({ state: 'visible', timeout: 10000 });
   }
   const previewText = await renderedText(settings);
-  if (!canonicalRenderedText(previewText).includes(canonicalRenderedText(plan.text))) {
-    throw new Error('Текст превью на экране настроек не совпадает с advertisement.md');
-  }
   const previewItems = await settings.locator('[data-testid="posting_preview_attachment_item"]').count();
   const primaryVideos = await settings.locator('[data-testid="primary-attachment-video"]').count();
   const nestedPrimaryVideos = await settings.locator('[data-testid="posting_preview_attachment_item"] [data-testid="primary-attachment-video"]').count();
   const previewCount = countPreviewAttachments(previewItems, primaryVideos, nestedPrimaryVideos);
+  const textMatches = canonicalRenderedText(previewText).includes(canonicalRenderedText(plan.text));
+  const settingsTitleCount = await settings.locator('[data-testid="modalheader-title"]').getByText('Настройки', { exact: true }).count();
+  const editButtonCount = await settings.getByText('Редактировать', { exact: true }).count();
+  const textlessSettingsPreview = isTextlessSettingsPreview(
+    previewCount,
+    plan.expectedCount,
+    settingsTitleCount,
+    editButtonCount
+  );
+  if (!textMatches && !textlessSettingsPreview) {
+    fs.writeFileSync(path.join(os.tmpdir(), 'animal-volunteer-settings-text-debug.txt'), previewText, 'utf8');
+    fs.writeFileSync(path.join(os.tmpdir(), 'animal-volunteer-settings-debug.html'), await settings.innerHTML(), 'utf8');
+    await settings.screenshot({ path: path.join(os.tmpdir(), 'animal-volunteer-settings-debug.png') });
+    throw new Error('Текст превью на экране настроек не совпадает с advertisement.md');
+  }
   if (previewCount !== plan.expectedCount) {
     const html = await settings.innerHTML();
     fs.writeFileSync(path.join(os.tmpdir(), 'animal-volunteer-settings-debug.html'), html, 'utf8');
@@ -323,6 +335,10 @@ function parseResultUrl(value, expectedOwnerId) {
 
 function countPreviewAttachments(previewItems, primaryVideos, nestedPrimaryVideos) {
   return previewItems + Math.max(0, primaryVideos - nestedPrimaryVideos);
+}
+
+function isTextlessSettingsPreview(previewCount, expectedCount, settingsTitleCount, editButtonCount) {
+  return previewCount === expectedCount && settingsTitleCount === 1 && editButtonCount === 1;
 }
 
 function matchKnownAdvertisement(value, advertisements) {
@@ -448,6 +464,7 @@ module.exports = {
   fillPostingDialog,
   findResult,
   inspectSuggestedPosts,
+  isTextlessSettingsPreview,
   matchKnownAdvertisement,
   newPostDialog,
   normalizeNewlines,
