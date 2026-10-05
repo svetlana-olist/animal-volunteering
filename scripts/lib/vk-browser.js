@@ -58,7 +58,7 @@ async function ensureSession(root) {
     if (!fs.existsSync(tokenPath)) throw new Error('Порт 9222 занят браузером, запущенным не этой CLI');
     token = fs.readFileSync(tokenPath, 'utf8').trim();
   }
-  const browser = await chromium.connectOverCDP(CDP_URL);
+  const browser = await chromium.connectOverCDP(CDP_URL, { timeout: 30000 });
   const context = browser.contexts()[0];
   let page;
   if (launched) {
@@ -76,7 +76,7 @@ async function ensureSession(root) {
   const storedToken = await page.evaluate(() => localStorage.getItem('__animalVolunteerCliSession'));
   if (!launched && storedToken !== token) {
     await browser.close();
-    throw new Error('Порт 9222 принадлежит другому или неподтвержденному профилю Edge');
+    throw new Error('Порт 9222 принадлежит другому или неподтвержденному профилю Edge. Закройте окно Edge с отладочным портом 9222 и повторите npm run vk -- session, чтобы CLI запустила проверенный сеанс');
   }
   if (launched) await page.evaluate(value => localStorage.setItem('__animalVolunteerCliSession', value), token);
   await page.bringToFront();
