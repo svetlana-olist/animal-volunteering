@@ -288,7 +288,8 @@ async function renderedText(locator) {
     const clone = element.cloneNode(true);
     clone.querySelectorAll('img[alt]').forEach(image => image.replaceWith(document.createTextNode(image.alt)));
     clone.querySelectorAll('a[href]').forEach(link => {
-      if (/^https?:\/\/vk\.(?:com|ru)\//i.test(link.href)) link.textContent = link.href;
+      if (/^(?:https?:\/\/)?(?:www\.)?vk\.(?:com|ru)\//i.test(link.textContent.trim())
+          && /^https?:\/\/vk\.(?:com|ru)\//i.test(link.href)) link.textContent = link.href;
     });
     clone.style.position = 'fixed';
     clone.style.left = '-9999px';
@@ -429,7 +430,7 @@ async function findResult(page, plan, { excludedPostIds = [], expectedOwnerId } 
   let result = await inspect();
   if (!result) {
     const suggested = page.getByText(/Предложенные\s+\d+/).first();
-    const href = await suggested.getAttribute('href').catch(() => null);
+    const href = await suggested.count() ? await suggested.getAttribute('href') : null;
     const suggestedUrl = href
       ? new URL(href, page.url()).href
       : expectedOwnerId ? `https://vk.ru/wall${expectedOwnerId}?suggested=1` : null;
@@ -469,6 +470,7 @@ module.exports = {
   newPostDialog,
   normalizeNewlines,
   parseResultUrl,
+  renderedText,
   selectGroupPage,
   verifyResultUrl,
   visiblePostIds,

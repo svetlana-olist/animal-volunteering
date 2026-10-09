@@ -5,12 +5,35 @@ const {
   countPreviewAttachments,
   isTextlessSettingsPreview,
   matchKnownAdvertisement,
-  parseResultUrl
+  parseResultUrl,
+  renderedText
 } = require('../scripts/lib/vk-browser');
 
 test('ignores only the trailing VK show-more control', () => {
   assert.equal(canonicalRenderedText('Марта ищет дом\nПоказать ещё'), 'Марта ищет дом');
   assert.equal(canonicalRenderedText('Показать ещё\nМарта ищет дом'), 'Показать ещё\nМарта ищет дом');
+});
+
+test('restores a shortened contact URL without rewriting the VK show-more control', async () => {
+  const links = [
+    { textContent: 'vk.ru/id175402691', href: 'https://vk.ru/id175402691' },
+    { textContent: 'Показать ещё', href: 'https://vk.ru/wall-11798322_25218' }
+  ];
+  const clone = {
+    style: {},
+    querySelectorAll: selector => selector === 'a[href]' ? links : [],
+    get innerText() { return `Рыся ищет дом\n${links.map(link => link.textContent).join('\n')}`; },
+    remove() {}
+  };
+  const locator = { evaluate: callback => {
+    const previous = global.document;
+    global.document = { body: { appendChild() {} } };
+    try { return callback({ cloneNode: () => clone }); }
+    finally { global.document = previous; }
+  } };
+  const value = await renderedText(locator);
+  assert.equal(value, 'Рыся ищет дом\nhttps://vk.ru/id175402691\nПоказать ещё');
+  assert.equal(canonicalRenderedText(value), canonicalRenderedText('Рыся ищет дом\nhttps://vk.ru/id175402691\n'));
 });
 
 test('recognizes an existing known advertisement after VK rendering changes', () => {

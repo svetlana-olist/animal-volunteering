@@ -12,6 +12,8 @@ const {
   fillPostingDialog,
   findResult,
   inspectSuggestedPosts,
+  renderedText,
+  canonicalRenderedText,
   selectGroupPage,
   verifyResultUrl,
   visiblePostIds
@@ -134,6 +136,17 @@ async function withSession(action) {
   }
 }
 
+async function withInspectionPage(action) {
+  return withSession(async ({ context }) => {
+    const page = await context.newPage();
+    try {
+      return await action(page);
+    } finally {
+      await page.close();
+    }
+  });
+}
+
 async function prepare(args) {
   if (fs.existsSync(statePath)) {
     const existing = loadState();
@@ -193,10 +206,12 @@ async function openGroup() {
     const body = await page.locator('body').innerText();
     if (!/Создать|Предложить пост|Предложить новость/.test(body)) throw new Error('В группе нет доступного способа создать запись');
     const suggested = page.getByText(/Предложенные\s+\d+/).first();
-    const suggestedLabel = await suggested.innerText().catch(() => '');
-    const suggestedHref = await suggested.getAttribute('href').catch(() => null);
+    const hasSuggested = await suggested.count();
+    const suggestedLabel = hasSuggested ? await suggested.innerText() : '';
+    const suggestedHref = hasSuggested ? await suggested.getAttribute('href') : null;
     state.suggestedHref = suggestedHref ? new URL(suggestedHref, page.url()).href : null;
     state.expectedSuggestedCount = suggestedLabel ? Number.parseInt(suggestedLabel.match(/\d+/)?.[0], 10) : null;
+    await page.locator('[data-testid="post"]').first().waitFor({ state: 'visible', timeout: 5000 }).catch(() => {});
     const visibleIds = await visiblePostIds(page);
     const owners = visibleIds.map(id => id.split('_')[0]).filter(owner => /^-\d+$/.test(owner));
     const counts = new Map(owners.map(owner => [owner, owners.filter(value => value === owner).length]));
@@ -233,7 +248,7 @@ async function fill(args) {
 async function inspectResult(args) {
   const state = loadState();
   const plan = checkedPlan(state, { eligibility: false });
-  await withSession(async ({ page }) => {
+  await withInspectionPage(async page => {
     const inspectPage = async () => page.locator('[data-testid="post"]').evaluateAll((posts, animal) => posts.map(post => ({
       postId: post.getAttribute('data-post-id'),
       mentionsAnimal: (post.innerText || '').includes(animal),
@@ -277,13 +292,16 @@ async function inspectResult(args) {
         }));
         mediaScreenshots.push(...screenshots);
       }
-      print({ stage: state.stage, url: target.href, posts, screenshot, mediaScreenshots });
+      const post = page.locator(`[data-testid="post"][data-post-id="${target.pathname.slice(5)}"]`);
+      const rendered = await renderedText(post.locator('[data-testid="post_text"]'));
+      print({ stage: state.stage, url: target.href, posts, screenshot, mediaScreenshots,
+        renderedText: rendered, textVerified: canonicalRenderedText(rendered) === canonicalRenderedText(plan.text) });
       return;
     }
     await page.goto(plan.group.url, { waitUntil: 'domcontentloaded' });
     await page.waitForTimeout(3000);
     const suggested = page.getByText(/Предложенные\s+\d+/).first();
-    const suggestedHref = await suggested.getAttribute('href').catch(() => null);
+    const suggestedHref = await suggested.count() ? await suggested.getAttribute('href') : null;
     const groupPosts = await inspectPage();
     let suggestedPosts = [];
     const suggestedUrl = suggestedHref || (state.expectedOwnerId ? `https://vk.ru/wall${state.expectedOwnerId}?suggested=1` : null);
