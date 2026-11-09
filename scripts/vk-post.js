@@ -4,6 +4,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
+const { captureMediaScreenshot } = require('./lib/result-review');
 const { createPostingPlan, eligibleGroups, hashPlan, loadKnownAdvertisements } = require('./lib/posting-plan');
 const {
   authorizationStatus,
@@ -267,6 +268,7 @@ async function inspectResult(args) {
       await page.locator(`[data-testid="post"][data-post-id="${target.pathname.slice(5)}"]`).waitFor({ state: 'visible', timeout: 5000 }).catch(() => {});
       const posts = await inspectPage();
       let screenshot = null;
+      let contactSheet = null;
       const mediaScreenshots = [];
       if (args.screenshot) {
         screenshot = path.join(os.tmpdir(), 'animal-volunteer-result.png');
@@ -283,18 +285,29 @@ async function inspectResult(args) {
           const mediaPage = await page.context().newPage();
           const mediaPath = path.join(os.tmpdir(), `animal-volunteer-media-${index + 1}.png`);
           try {
-            await mediaPage.goto(source, { waitUntil: 'load' });
-            await mediaPage.screenshot({ path: mediaPath });
+            await captureMediaScreenshot(mediaPage, source, mediaPath, index);
             return mediaPath;
           } finally {
             await mediaPage.close();
           }
         }));
         mediaScreenshots.push(...screenshots);
+        if (screenshots.length !== plan.expectedCount) throw new Error('Число снимков вложений не совпадает с планом');
+        const sheetPage = await page.context().newPage();
+        try {
+          await sheetPage.setViewportSize({ width: 1440, height: Math.ceil(screenshots.length / 3) * 440 });
+          await sheetPage.setContent(`<body style="margin:0;display:grid;grid-template-columns:repeat(3,480px);background:#eee">${screenshots.map((file, index) =>
+            `<div style="height:440px;text-align:center"><img style="width:480px;height:410px;object-fit:contain" src="data:image/png;base64,${fs.readFileSync(file).toString('base64')}"><div>Media ${index + 1}</div></div>`).join('')}</body>`);
+          await sheetPage.locator('img').evaluateAll(images => Promise.all(images.map(image => image.decode())));
+          contactSheet = path.join(os.tmpdir(), 'animal-volunteer-result-sheet.png');
+          await sheetPage.screenshot({ path: contactSheet, fullPage: true });
+        } finally {
+          await sheetPage.close();
+        }
       }
       const post = page.locator(`[data-testid="post"][data-post-id="${target.pathname.slice(5)}"]`);
       const rendered = await renderedText(post.locator('[data-testid="post_text"]'));
-      print({ stage: state.stage, url: target.href, posts, screenshot, mediaScreenshots,
+      print({ stage: state.stage, url: target.href, posts, screenshot, mediaScreenshots, contactSheet,
         renderedText: rendered, textVerified: canonicalRenderedText(rendered) === canonicalRenderedText(plan.text) });
       return;
     }
@@ -374,7 +387,20 @@ async function verify(args) {
       expectedOwnerId: state.expectedOwnerId
     });
     if (!result) {
-      print({ stage: state.stage, verified: false, warning: 'Запись не найдена. Не нажимайте отправку повторно.' });
+      const inspectCandidates = async () => ({
+        url: page.url(),
+        posts: await page.locator('[data-testid="post"]').evaluateAll(posts => posts.map(post => ({
+          postId: post.getAttribute('data-post-id'),
+          text: post.querySelector('[data-testid="post_text"]')?.innerText || '',
+          attachmentCount: new Set([...post.querySelectorAll('a')].map(link => link.getAttribute('href') || '')
+            .filter(href => href.includes('/photo') || href.includes('/video'))).size
+        })))
+      });
+      const suggested = await inspectCandidates();
+      await page.goto(plan.group.url, { waitUntil: 'domcontentloaded' });
+      await page.locator('[data-testid="post"]').first().waitFor({ state: 'visible', timeout: 5000 }).catch(() => {});
+      const group = await inspectCandidates();
+      print({ stage: state.stage, verified: false, diagnostics: { suggested, group }, warning: 'Запись не найдена. Не нажимайте отправку повторно.' });
       process.exitCode = 3;
       return;
     }
