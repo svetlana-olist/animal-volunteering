@@ -6,6 +6,35 @@ const { spawn } = require('child_process');
 const { chromium } = require('playwright');
 
 const CDP_URL = 'http://127.0.0.1:9222';
+const POST_SELECTOR = '[data-testid="post"], [data-spa-post-legacy-selector="1"][data-post-id][data-post-nesting-lvl="0"]';
+const POST_TEXT_SELECTOR = '[data-testid="post_text"], span[data-post-id][id^="text-"]';
+const ATTACHMENT_SELECTOR = '[data-testid="posting_attachment_item"], [data-sortable-item="true"][data-sortable-id]';
+
+async function waitForAttachmentCount(dialog, expected, timeout = 30000) {
+  const deadline = Date.now() + timeout;
+  let stableSince = null;
+  do {
+    const count = await dialog.locator(ATTACHMENT_SELECTOR).count();
+    const ready = await dialog.locator(ATTACHMENT_SELECTOR).evaluateAll(items => items.every(item => {
+      const id = item.getAttribute('data-sortable-id');
+      return id === null
+        ? item.getAttribute('data-testid') === 'posting_attachment_item'
+        : /^(?:photo|video)-?\d+_\d+$/.test(id);
+    }));
+    if (count === expected && ready) {
+      stableSince ??= Date.now();
+      if (Date.now() - stableSince >= 1500) return;
+    } else stableSince = null;
+    if (count > expected) throw new Error(`Лишние вложения: ожидалось ${expected}, найдено ${count}`);
+    await new Promise(resolve => setTimeout(resolve, 300));
+  } while (Date.now() < deadline);
+  throw new Error(`Не подтверждено число вложений ${expected}; повторная загрузка запрещена до проверки формы`);
+}
+
+function postSelector(postId) {
+  if (!/^-\d+_\d+$/.test(postId)) throw new Error('Некорректный ID записи');
+  return POST_SELECTOR.split(', ').map(selector => `${selector}[data-post-id="${postId}"]`).join(', ');
+}
 
 async function cdpAvailable() {
   try {
@@ -96,7 +125,7 @@ async function authorizationStatus(page) {
   return inspect();
 }
 
-async function selectGroupPage(context, plan, { requireDialog = false } = {}) {
+async function selectGroupPage(context, plan, { requireDialog = false, preferredPage = null } = {}) {
   const candidates = [];
   for (const page of context.pages()) {
     let key = null;
@@ -110,9 +139,10 @@ async function selectGroupPage(context, plan, { requireDialog = false } = {}) {
     if (requireDialog && !await postingDialog(page).count()) continue;
     candidates.push(page);
   }
-  if (candidates.length !== 1) throw new Error(`Ожидалась одна вкладка выбранной группы, найдено: ${candidates.length}`);
-  await candidates[0].bringToFront();
-  return candidates[0];
+  const selected = candidates.includes(preferredPage) ? preferredPage : candidates.length === 1 ? candidates[0] : null;
+  if (!selected) throw new Error(`Ожидалась одна вкладка выбранной группы, найдено: ${candidates.length}`);
+  await selected.bringToFront();
+  return selected;
 }
 
 function newPostDialog(page) {
@@ -133,6 +163,8 @@ function postingDialog(page) {
 }
 
 async function openPostingDialog(page) {
+  const existing = newPostDialog(page);
+  if (await existing.isVisible()) return existing;
   const candidates = ['Предложить пост', 'Предложить новость', 'Создать'];
   for (const label of candidates) {
     const locator = page.getByText(label, { exact: true }).filter({ visible: true }).first();
@@ -162,28 +194,40 @@ async function editorText(editor) {
   return normalizeNewlines(await editor.innerText());
 }
 
+async function discardPostingDraft(page) {
+  const dialog = newPostDialog(page);
+  if (!await dialog.isVisible()) throw new Error('Ожидался открытый черновик «Новый пост»');
+  const count = await dialog.locator(ATTACHMENT_SELECTOR).count();
+  for (let remaining = count; remaining > 0; remaining -= 1) {
+    await dialog.getByRole('button', { name: 'Удалить', exact: true }).first().click();
+    await waitForAttachmentCount(dialog, remaining - 1, 5000);
+  }
+  const editor = dialog.locator('[role="textbox"][contenteditable="true"]');
+  await editor.fill('');
+  if ((await editorText(editor)).trim() || await dialog.locator(ATTACHMENT_SELECTOR).count()) throw new Error('Черновик не очищен');
+  await dialog.getByText('Закрыть', { exact: true }).click();
+  await dialog.waitFor({ state: 'hidden', timeout: 5000 });
+}
+
 async function fillPostingDialog(page, plan) {
   const dialog = await openPostingDialog(page);
-  const editor = dialog.locator('[data-testid="posting_base_screen_input_message"]');
+  const editor = dialog.locator('[data-testid="posting_base_screen_input_message"], [role="textbox"][contenteditable="true"][aria-label="Напишите что-нибудь..."]');
   if (!await editor.count()) throw new Error('Редактор текста в диалоге не найден');
-  const draftCount = await dialog.locator('[data-testid="posting_attachment_item"]').count();
+  const draftCount = await dialog.locator(ATTACHMENT_SELECTOR).count();
   const draftText = await editorText(editor);
   const expectedText = normalizeNewlines(plan.text);
   const draftHtml = await editor.innerHTML();
   const draftMatches = draftText === expectedText || (draftText === `${expectedText}\n` && /<br><br>\s*$/.test(draftHtml));
   if (draftCount === plan.expectedCount && draftMatches) {
+    await waitForAttachmentCount(dialog, plan.expectedCount);
     return { count: draftCount, textVerified: true, restoredDraft: true };
   }
   if (draftCount || draftText.trim()) {
     for (let remaining = draftCount; remaining > 0; remaining -= 1) {
-      const remove = dialog.locator('[data-testid="posting_attachment_photo_item_remove"], [data-testid="posting_attachment_video_item_remove"]').first();
+      const remove = dialog.getByRole('button', { name: 'Удалить', exact: true }).first();
       if (!await remove.count()) throw new Error('В восстановленном черновике не найдена кнопка удаления вложения');
       await remove.click();
-      await page.waitForFunction(
-        count => document.querySelectorAll('[role="dialog"] [data-testid="posting_attachment_item"]').length === count,
-        remaining - 1,
-        { timeout: 5000 }
-      );
+      await waitForAttachmentCount(dialog, remaining - 1, 5000);
     }
     await editor.fill('');
   }
@@ -191,27 +235,11 @@ async function fillPostingDialog(page, plan) {
   if (!await input.count()) throw new Error('В диалоге нового поста нет файлового input');
   for (let index = 0; index < plan.media.length; index += 1) {
     const expected = index + 1;
-    for (let attempt = 0; attempt < 2; attempt += 1) {
-      await input.setInputFiles(plan.media[index]);
-      try {
-        await page.waitForFunction(
-          count => document.querySelectorAll('[role="dialog"] [data-testid="posting_attachment_item"]').length === count,
-          expected,
-          { timeout: 30000 }
-        );
-        break;
-      } catch (error) {
-        const actual = await dialog.locator('[data-testid="posting_attachment_item"]').count();
-        if (actual === expected) break;
-        if (actual !== index || attempt === 1) {
-          throw new Error(`Фото ${index + 1} не загрузилось: ожидалось вложений ${expected}, найдено ${actual}`);
-        }
-        // The count proves that VK did not add this file, so one retry cannot create a duplicate.
-      }
-    }
+    await input.setInputFiles(plan.media[index]);
+    await waitForAttachmentCount(dialog, expected);
   }
   await page.waitForTimeout(1500);
-  const count = await dialog.locator('[data-testid="posting_attachment_item"]').count();
+  const count = await dialog.locator(ATTACHMENT_SELECTOR).count();
   if (count !== plan.expectedCount) throw new Error(`Ожидалось вложений: ${plan.expectedCount}, получено: ${count}`);
 
   await editor.fill(plan.text);
@@ -226,9 +254,10 @@ async function fillPostingDialog(page, plan) {
 async function verifyPreparedForm(page, plan) {
   const dialog = newPostDialog(page);
   if (!await dialog.count()) throw new Error('Проверенная форма «Новый пост» больше не открыта');
-  const count = await dialog.locator('[data-testid="posting_attachment_item"]').count();
+  await waitForAttachmentCount(dialog, plan.expectedCount);
+  const count = await dialog.locator(ATTACHMENT_SELECTOR).count();
   if (count !== plan.expectedCount) throw new Error('Количество вложений изменилось после проверки');
-  const editor = dialog.locator('[data-testid="posting_base_screen_input_message"]');
+  const editor = dialog.locator('[data-testid="posting_base_screen_input_message"], [role="textbox"][contenteditable="true"][aria-label="Напишите что-нибудь..."]');
   const actual = await editorText(editor);
   const expected = normalizeNewlines(plan.text);
   const html = await editor.innerHTML();
@@ -253,7 +282,8 @@ async function clickPublishOnce(page, plan, beforeSubmit) {
   const previewItems = await settings.locator('[data-testid="posting_preview_attachment_item"]').count();
   const primaryVideos = await settings.locator('[data-testid="primary-attachment-video"]').count();
   const nestedPrimaryVideos = await settings.locator('[data-testid="posting_preview_attachment_item"] [data-testid="primary-attachment-video"]').count();
-  const previewCount = countPreviewAttachments(previewItems, primaryVideos, nestedPrimaryVideos);
+  const legacyPreviewCount = countPreviewAttachments(previewItems, primaryVideos, nestedPrimaryVideos);
+  const previewCount = legacyPreviewCount || await settings.locator('[data-sortable-root="true"] > div:has(img)').count();
   const textMatches = canonicalRenderedText(previewText).includes(canonicalRenderedText(plan.text));
   const settingsTitleCount = await settings.locator('[data-testid="modalheader-title"]').getByText('Настройки', { exact: true }).count();
   const editButtonCount = await settings.getByText('Редактировать', { exact: true }).count();
@@ -352,12 +382,12 @@ async function inspectSuggestedPosts(page, advertisements, { expectedCount = nul
   let stableRounds = 0;
   for (let attempt = 0; attempt < 20 && stableRounds < 2; attempt += 1) {
     const sizeBefore = postIds.size;
-    const posts = page.locator('[data-testid="post"]');
+    const posts = page.locator(POST_SELECTOR);
     for (let index = 0; index < await posts.count(); index += 1) {
       const post = posts.nth(index);
       const postId = await post.getAttribute('data-post-id');
       if (postId) postIds.add(postId);
-      const textLocator = post.locator('[data-testid="post_text"]');
+      const textLocator = post.locator(POST_TEXT_SELECTOR);
       if (!await textLocator.count()) continue;
       const match = matchKnownAdvertisement(await renderedText(textLocator), advertisements);
       if (match) return { postIds: [...postIds], duplicate: { animal: match.animal, postId }, complete: true };
@@ -376,20 +406,20 @@ async function inspectSuggestedPosts(page, advertisements, { expectedCount = nul
 }
 
 async function visiblePostIds(page) {
-  return page.locator('[data-testid="post"]').evaluateAll(posts => posts.map(post => post.getAttribute('data-post-id')).filter(Boolean));
+  return page.locator(POST_SELECTOR).evaluateAll(posts => posts.map(post => post.getAttribute('data-post-id')).filter(Boolean));
 }
 
 async function findMatchingPost(page, plan, { excludedPostIds = [], expectedOwnerId, targetPostId = null } = {}) {
   const posts = targetPostId
-    ? page.locator(`[data-testid="post"][data-post-id="${targetPostId}"]`)
-    : page.locator('[data-testid="post"]');
+    ? page.locator(postSelector(targetPostId))
+    : page.locator(POST_SELECTOR);
   for (let index = 0; index < await posts.count(); index += 1) {
     const post = posts.nth(index);
     const postId = await post.getAttribute('data-post-id');
     if (!postId || excludedPostIds.includes(postId)) continue;
     const ownerId = postId.split('_')[0];
     if (expectedOwnerId && ownerId !== expectedOwnerId) continue;
-    const textLocator = post.locator('[data-testid="post_text"]');
+    const textLocator = post.locator(POST_TEXT_SELECTOR);
     if (!await textLocator.count()) continue;
     const text = await renderedText(textLocator);
     if (canonicalRenderedText(text) !== canonicalRenderedText(plan.text)) continue;
@@ -406,7 +436,7 @@ async function findMatchingPost(page, plan, { excludedPostIds = [], expectedOwne
 async function verifyResultUrl(page, plan, value, { excludedPostIds = [], expectedOwnerId } = {}) {
   const target = parseResultUrl(value, expectedOwnerId);
   await page.goto(target.url, { waitUntil: 'domcontentloaded' });
-  await page.locator(`[data-testid="post"][data-post-id="${target.postId}"]`).waitFor({ state: 'visible', timeout: 5000 }).catch(() => {});
+  await page.locator(postSelector(target.postId)).waitFor({ state: 'visible', timeout: 5000 }).catch(() => {});
   const result = await findMatchingPost(page, plan, {
     excludedPostIds,
     expectedOwnerId,
@@ -457,10 +487,14 @@ async function findResult(page, plan, { excludedPostIds = [], expectedOwnerId } 
 }
 
 module.exports = {
+  POST_SELECTOR,
+  POST_TEXT_SELECTOR,
+  postSelector,
   authorizationStatus,
   canonicalRenderedText,
   clickPublishOnce,
   countPreviewAttachments,
+  discardPostingDraft,
   ensureSession,
   fillPostingDialog,
   findResult,
@@ -474,5 +508,6 @@ module.exports = {
   selectGroupPage,
   verifyResultUrl,
   visiblePostIds,
+  waitForAttachmentCount,
   verifyPreparedForm
 };

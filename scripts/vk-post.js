@@ -7,7 +7,11 @@ const crypto = require('crypto');
 const { captureMediaScreenshot } = require('./lib/result-review');
 const { createPostingPlan, eligibleGroups, hashPlan, loadKnownAdvertisements } = require('./lib/posting-plan');
 const {
+  POST_SELECTOR,
+  POST_TEXT_SELECTOR,
+  postSelector,
   authorizationStatus,
+  discardPostingDraft,
   clickPublishOnce,
   ensureSession,
   fillPostingDialog,
@@ -212,7 +216,7 @@ async function openGroup() {
     const suggestedHref = hasSuggested ? await suggested.getAttribute('href') : null;
     state.suggestedHref = suggestedHref ? new URL(suggestedHref, page.url()).href : null;
     state.expectedSuggestedCount = suggestedLabel ? Number.parseInt(suggestedLabel.match(/\d+/)?.[0], 10) : null;
-    await page.locator('[data-testid="post"]').first().waitFor({ state: 'visible', timeout: 5000 }).catch(() => {});
+    await page.locator(POST_SELECTOR).first().waitFor({ state: 'visible', timeout: 5000 }).catch(() => {});
     const visibleIds = await visiblePostIds(page);
     const owners = visibleIds.map(id => id.split('_')[0]).filter(owner => /^-\d+$/.test(owner));
     const counts = new Map(owners.map(owner => [owner, owners.filter(value => value === owner).length]));
@@ -234,12 +238,29 @@ async function fill(args) {
   const state = loadState();
   const plan = checkedPlan(state);
   if (!['group_checked', 'form_verified'].includes(state.stage)) throw new Error(`Команда недоступна в состоянии ${state.stage}`);
-  await withSession(async ({ context }) => {
-    const page = await selectGroupPage(context, plan);
+  await withSession(async ({ context, page: preferredPage }) => {
+    const page = await selectGroupPage(context, plan, { preferredPage });
     const auth = await authorizationStatus(page);
     if (!auth.authorized) throw new Error('Авторизация VK не подтверждена');
     await checkSuggestedPosts(context, state);
-    const result = await fillPostingDialog(page, plan);
+    const uploadErrors = [];
+    page.on('response', response => {
+      if (response.status() >= 400 && uploadErrors.length < 20) {
+        const url = new URL(response.url());
+        uploadErrors.push({ status: response.status(), host: url.hostname, path: url.pathname });
+      }
+    });
+    page.on('requestfailed', request => {
+      if (uploadErrors.length >= 20) return;
+      const url = new URL(request.url());
+      uploadErrors.push({ host: url.hostname, path: url.pathname, error: request.failure()?.errorText });
+    });
+    let result;
+    try { result = await fillPostingDialog(page, plan); }
+    catch (error) {
+      print({ stage: state.stage, error: error.message, uploadErrors });
+      throw error;
+    }
     state.reviewToken = crypto.randomBytes(6).toString('hex');
     transition(state, ['group_checked', 'form_verified'], 'form_verified');
     print({ stage: state.stage, ...result, reviewToken: state.reviewToken, next: `publish --token ${state.reviewToken}` });
@@ -250,32 +271,32 @@ async function inspectResult(args) {
   const state = loadState();
   const plan = checkedPlan(state, { eligibility: false });
   await withInspectionPage(async page => {
-    const inspectPage = async () => page.locator('[data-testid="post"]').evaluateAll((posts, animal) => posts.map(post => ({
+    const inspectPage = async () => page.locator(POST_SELECTOR).evaluateAll((posts, { animal, textSelector }) => posts.map(post => ({
       postId: post.getAttribute('data-post-id'),
       mentionsAnimal: (post.innerText || '').includes(animal),
       textStart: (post.innerText || '').slice(0, 120),
-      postText: (post.querySelector('[data-testid="post_text"]')?.innerText || '').includes(animal)
-        ? post.querySelector('[data-testid="post_text"]').innerText
+      postText: (post.querySelector(textSelector)?.innerText || '').includes(animal)
+        ? post.querySelector(textSelector).innerText
         : null,
       mediaLinks: new Set([...post.querySelectorAll('a')].map(link => link.getAttribute('href') || '').filter(href => href.includes('/photo') || href.includes('/video'))).size
-    })), plan.animal);
+    })), { animal: plan.animal, textSelector: POST_TEXT_SELECTOR });
     if (args.url) {
       const target = new URL(args.url);
       if (!/^(?:www\.)?vk\.(?:com|ru)$/i.test(target.hostname) || !target.pathname.startsWith(`/wall${state.expectedOwnerId}_`)) {
         throw new Error('Диагностическая ссылка должна вести на запись выбранной группы');
       }
       await page.goto(target.href, { waitUntil: 'domcontentloaded' });
-      await page.locator(`[data-testid="post"][data-post-id="${target.pathname.slice(5)}"]`).waitFor({ state: 'visible', timeout: 5000 }).catch(() => {});
+      await page.locator(postSelector(target.pathname.slice(5))).waitFor({ state: 'visible', timeout: 5000 }).catch(() => {});
       const posts = await inspectPage();
       let screenshot = null;
       let contactSheet = null;
       const mediaScreenshots = [];
       if (args.screenshot) {
         screenshot = path.join(os.tmpdir(), 'animal-volunteer-result.png');
-        await page.locator(`[data-testid="post"][data-post-id="${target.pathname.slice(5)}"]`).screenshot({ path: screenshot });
+        await page.locator(postSelector(target.pathname.slice(5))).screenshot({ path: screenshot });
       }
       if (args['screenshot-all']) {
-        const post = page.locator(`[data-testid="post"][data-post-id="${target.pathname.slice(5)}"]`);
+        const post = page.locator(postSelector(target.pathname.slice(5)));
         const mediaSources = await post.locator('a').evaluateAll(elements => elements
           .map(element => ({ href: element.getAttribute('href') || '', src: element.querySelector('img')?.src || '' }))
           .filter(item => (item.href.includes('/photo') || item.href.includes('/video')) && item.src)
@@ -305,8 +326,8 @@ async function inspectResult(args) {
           await sheetPage.close();
         }
       }
-      const post = page.locator(`[data-testid="post"][data-post-id="${target.pathname.slice(5)}"]`);
-      const rendered = await renderedText(post.locator('[data-testid="post_text"]'));
+      const post = page.locator(postSelector(target.pathname.slice(5)));
+      const rendered = await renderedText(post.locator(POST_TEXT_SELECTOR));
       print({ stage: state.stage, url: target.href, posts, screenshot, mediaScreenshots, contactSheet,
         renderedText: rendered, textVerified: canonicalRenderedText(rendered) === canonicalRenderedText(plan.text) });
       return;
@@ -335,8 +356,8 @@ async function publish(args) {
   }
   if (state.stage !== 'form_verified') throw new Error(`Команда недоступна в состоянии ${state.stage}`);
   if (!args.token || args.token !== state.reviewToken) throw new Error('Нужен reviewToken из команды fill');
-  await withSession(async ({ context }) => {
-    const page = await selectGroupPage(context, plan, { requireDialog: true });
+  await withSession(async ({ context, page: preferredPage }) => {
+    const page = await selectGroupPage(context, plan, { requireDialog: true, preferredPage });
     const beforePostIds = await visiblePostIds(page);
     state.beforePostIds = beforePostIds;
     await checkSuggestedPosts(context, state);
@@ -389,16 +410,16 @@ async function verify(args) {
     if (!result) {
       const inspectCandidates = async () => ({
         url: page.url(),
-        posts: await page.locator('[data-testid="post"]').evaluateAll(posts => posts.map(post => ({
+        posts: await page.locator(POST_SELECTOR).evaluateAll((posts, textSelector) => posts.map(post => ({
           postId: post.getAttribute('data-post-id'),
-          text: post.querySelector('[data-testid="post_text"]')?.innerText || '',
+          text: post.querySelector(textSelector)?.innerText || '',
           attachmentCount: new Set([...post.querySelectorAll('a')].map(link => link.getAttribute('href') || '')
             .filter(href => href.includes('/photo') || href.includes('/video'))).size
-        })))
+        })), POST_TEXT_SELECTOR)
       });
       const suggested = await inspectCandidates();
       await page.goto(plan.group.url, { waitUntil: 'domcontentloaded' });
-      await page.locator('[data-testid="post"]').first().waitFor({ state: 'visible', timeout: 5000 }).catch(() => {});
+      await page.locator(POST_SELECTOR).first().waitFor({ state: 'visible', timeout: 5000 }).catch(() => {});
       const group = await inspectCandidates();
       print({ stage: state.stage, verified: false, diagnostics: { suggested, group }, warning: 'Запись не найдена. Не нажимайте отправку повторно.' });
       process.exitCode = 3;
@@ -422,7 +443,7 @@ async function resolveDeleted(args) {
   await withSession(async ({ page }) => {
     await page.goto(target.href, { waitUntil: 'domcontentloaded' });
     await page.waitForTimeout(2000);
-    const post = page.locator(`[data-testid="post"][data-post-id="${target.pathname.slice(5)}"]`);
+    const post = page.locator(postSelector(target.pathname.slice(5)));
     if (!await post.count() || !/Пост удалён/.test(await post.innerText())) {
       throw new Error('VK не подтверждает, что эта запись удалена');
     }
@@ -459,8 +480,62 @@ function status() {
   });
 }
 
+async function inspectGroup(args) {
+  const inspect = async page => {
+    const state = loadState();
+    const url = args.suggested ? state.suggestedHref : state.plan.group.url;
+    if (!url) throw new Error('Сначала выполните open-group');
+    if (!args.current) await page.goto(url, { waitUntil: 'domcontentloaded' });
+    await page.waitForTimeout(2000);
+    const auth = await authorizationStatus(page);
+    if (!auth.authorized) throw new Error('Сначала подтвердите авторизацию командой session');
+    const screenshot = path.join(os.tmpdir(), 'animal-volunteer-group.png');
+    await page.screenshot({ path: screenshot });
+    const diagnostics = await page.locator('body').evaluate(body => ({
+      text: body.innerText,
+      dialogs: [...body.querySelectorAll('[role="dialog"]')].filter(dialog => /Новый пост|Редактировать/.test(dialog.innerText)).map(dialog => ({
+        text: dialog.innerText,
+        mediaStructure: [...dialog.querySelectorAll('img, video')].map(element => ({
+          tag: element.tagName, src: element.getAttribute('src'),
+          ancestors: Array.from({ length: 7 }, (_, index) => {
+            let parent = element;
+            for (let depth = 0; depth <= index; depth += 1) parent = parent?.parentElement;
+            return parent;
+          }).filter(Boolean).map(parent => ({
+            tag: parent.tagName, attributes: Object.fromEntries([...parent.attributes].map(attribute => [attribute.name, attribute.value]))
+          }))
+        })),
+        inputs: [...dialog.querySelectorAll('input, textarea, [contenteditable], button')].map(element => ({
+          tag: element.tagName, type: element.type, role: element.getAttribute('role'), editable: element.getAttribute('contenteditable'),
+          testId: element.getAttribute('data-testid'), label: element.getAttribute('aria-label'), text: element.innerText
+        }))
+      })),
+      postElements: [...body.querySelectorAll('[data-post-id], [id^="post-"]')].map(element => ({
+        tag: element.tagName, id: element.id, testId: element.getAttribute('data-testid'), postId: element.getAttribute('data-post-id')
+      })),
+      wallLinks: [...new Set([...body.querySelectorAll('a[href]')].map(link => link.getAttribute('href')).filter(href => /wall-\d+/.test(href)))]
+    }));
+    print({ url: page.url(), screenshot, ...diagnostics });
+  };
+  if (args.current) await withSession(({ page }) => inspect(page));
+  else await withInspectionPage(inspect);
+}
+
+async function discardDraft() {
+  const state = loadState();
+  if (!['group_checked', 'form_verified'].includes(state.stage)) throw new Error(`Очистка недоступна в состоянии ${state.stage}`);
+  await withSession(async ({ context, page: preferredPage }) => {
+    if (!(await authorizationStatus(preferredPage)).authorized) throw new Error('Сначала подтвердите авторизацию командой session');
+    const page = await selectGroupPage(context, state.plan, { requireDialog: true, preferredPage });
+    await discardPostingDraft(page);
+    delete state.reviewToken;
+    transition(state, ['group_checked', 'form_verified'], 'prepared');
+    print({ stage: state.stage, draftDiscarded: true });
+  });
+}
+
 function usage() {
-  process.stdout.write(`Команды:\n  candidates --animal <имя> [--species dogs|cats] [--all]\n  prepare --animal <имя> [--species dogs|cats] --group-url <url> --media-reviewed [--replace]\n  session\n  open-group\n  fill --suggested-reviewed\n  publish --token <reviewToken>\n  verify [--url <post-url>]\n  inspect-result [--url <post-url>] [--screenshot-all]\n  resolve-confirmed --animal <имя>\n  resolve-deleted --url <post-url>\n  status\n`);
+  process.stdout.write(`Команды:\n  candidates --animal <имя> [--species dogs|cats] [--all]\n  prepare --animal <имя> [--species dogs|cats] --group-url <url> --media-reviewed [--replace]\n  session\n  open-group\n  inspect-group [--suggested | --current]\n  fill --suggested-reviewed\n  discard-draft\n  publish --token <reviewToken>\n  verify [--url <post-url>]\n  inspect-result [--url <post-url>] [--screenshot-all]\n  resolve-confirmed --animal <имя>\n  resolve-deleted --url <post-url>\n  status\n`);
 }
 
 async function main() {
@@ -477,6 +552,8 @@ async function main() {
   if (command === 'resolve-confirmed') return withLock(() => resolveConfirmed(args));
   if (command === 'resolve-deleted') return withLock(() => resolveDeleted(args));
   if (command === 'status') return status();
+  if (command === 'inspect-group') return inspectGroup(args);
+  if (command === 'discard-draft') return withLock(discardDraft);
   usage();
   if (command) process.exitCode = 1;
 }
