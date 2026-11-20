@@ -106,7 +106,9 @@ async function withLock(action) {
 }
 
 function print(value) {
-  process.stdout.write(`${JSON.stringify({ ...value, elapsedMs: Date.now() - commandStartedAt }, null, 2)}\n`);
+  process.stdout.write(`${JSON.stringify({ ...value,
+    atMoscow: new Date().toLocaleString('sv-SE', { timeZone: 'Europe/Moscow' }),
+    elapsedMs: Date.now() - commandStartedAt }, null, 2)}\n`);
 }
 
 async function checkSuggestedPosts(context, state) {
@@ -127,6 +129,12 @@ async function checkSuggestedPosts(context, state) {
     if (!result.complete) {
       throw new Error(`Не удалось проверить всю предложку: найдено ${result.postIds.length} из ${state.expectedSuggestedCount} записей. Публикация запрещена`);
     }
+    return {
+      url: suggestedPage.url(),
+      posts: result.posts,
+      complete: result.complete,
+      emptyMessage: result.postIds.length ? null : (await suggestedPage.locator('body').innerText()).match(/Ничего не\s*найдено/)?.[0] || null
+    };
   } finally {
     await suggestedPage.close();
   }
@@ -209,7 +217,10 @@ async function openGroup() {
     if (actualKey !== plan.group.key) throw new Error(`VK перенаправил на другую страницу: ${page.url()}`);
     const title = await page.title();
     const body = await page.locator('body').innerText();
-    if (!/Создать|Предложить пост|Предложить новость/.test(body)) throw new Error('В группе нет доступного способа создать запись');
+    if (!/Создать|Предложить пост|Предложить новость/.test(body)) {
+      print({ stage: state.stage, available: false, title, url: page.url(), reason: 'Нет способа создать или предложить запись', pageText: body });
+      throw new Error('В группе нет доступного способа создать запись');
+    }
     const suggested = page.getByText(/Предложенные\s+\d+/).first();
     const hasSuggested = await suggested.count();
     const suggestedLabel = hasSuggested ? await suggested.innerText() : '';
@@ -227,9 +238,9 @@ async function openGroup() {
     else {
       throw new Error('Не удалось однозначно определить owner ID выбранной группы');
     }
-    await checkSuggestedPosts(context, state);
+    const suggestedReview = await checkSuggestedPosts(context, state);
     transition(state, ['prepared', 'group_checked'], 'group_checked');
-    print({ stage: state.stage, title, url: page.url(), suggestedHref: state.suggestedHref, next: 'Проверьте предложенные, затем fill --suggested-reviewed' });
+    print({ stage: state.stage, title, url: page.url(), suggestedHref: state.suggestedHref, suggestedReview, next: 'Проверьте предложенные в suggestedReview, затем fill --suggested-reviewed' });
   });
 }
 
@@ -328,8 +339,11 @@ async function inspectResult(args) {
       }
       const post = page.locator(postSelector(target.pathname.slice(5)));
       const rendered = await renderedText(post.locator(POST_TEXT_SELECTOR));
-      print({ stage: state.stage, url: target.href, posts, screenshot, mediaScreenshots, contactSheet,
-        renderedText: rendered, textVerified: canonicalRenderedText(rendered) === canonicalRenderedText(plan.text) });
+      const textVerified = canonicalRenderedText(rendered) === canonicalRenderedText(plan.text);
+      print({ stage: state.stage, animal: plan.animal, url: target.href,
+        posts: args.details ? posts : posts.map(({ postId, mediaLinks }) => ({ postId, mediaLinks })),
+        screenshot, mediaScreenshots, contactSheet,
+        renderedText: args.details || !textVerified ? rendered : undefined, textVerified });
       return;
     }
     await page.goto(plan.group.url, { waitUntil: 'domcontentloaded' });
@@ -475,6 +489,8 @@ function status() {
     animal: state.plan.animal,
     group: state.plan.group,
     expectedCount: state.plan.expectedCount,
+    updatedAt: state.updatedAt || null,
+    updatedAtMoscow: state.updatedAt ? new Date(state.updatedAt).toLocaleString('sv-SE', { timeZone: 'Europe/Moscow' }) : null,
     reviewToken: state.stage === 'form_verified' ? state.reviewToken : null,
     result: state.result || null
   });

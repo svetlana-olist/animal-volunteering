@@ -10,17 +10,23 @@ const POST_SELECTOR = '[data-testid="post"], [data-spa-post-legacy-selector="1"]
 const POST_TEXT_SELECTOR = '[data-testid="post_text"], span[data-post-id][id^="text-"]';
 const ATTACHMENT_SELECTOR = '[data-testid="posting_attachment_item"], [data-sortable-item="true"][data-sortable-id]';
 
-async function waitForAttachmentCount(dialog, expected, timeout = 30000) {
-  const deadline = Date.now() + timeout;
-  let stableSince = null;
-  do {
-    const count = await dialog.locator(ATTACHMENT_SELECTOR).count();
-    const ready = await dialog.locator(ATTACHMENT_SELECTOR).evaluateAll(items => items.every(item => {
+async function attachmentState(dialog) {
+  return dialog.locator(ATTACHMENT_SELECTOR).evaluateAll(items => ({
+    count: items.length,
+    ready: items.every(item => {
       const id = item.getAttribute('data-sortable-id');
       return id === null
         ? item.getAttribute('data-testid') === 'posting_attachment_item'
         : /^(?:photo|video)-?\d+_\d+$/.test(id);
-    }));
+    })
+  }));
+}
+
+async function waitForAttachmentCount(dialog, expected, timeout = 30000) {
+  const deadline = Date.now() + timeout;
+  let stableSince = null;
+  do {
+    const { count, ready } = await attachmentState(dialog);
     if (count === expected && ready) {
       stableSince ??= Date.now();
       if (Date.now() - stableSince >= 1500) return;
@@ -238,9 +244,8 @@ async function fillPostingDialog(page, plan) {
     await input.setInputFiles(plan.media[index]);
     await waitForAttachmentCount(dialog, expected);
   }
-  await page.waitForTimeout(1500);
-  const count = await dialog.locator(ATTACHMENT_SELECTOR).count();
-  if (count !== plan.expectedCount) throw new Error(`Ожидалось вложений: ${plan.expectedCount}, получено: ${count}`);
+  const { count, ready } = await attachmentState(dialog);
+  if (count !== plan.expectedCount || !ready) throw new Error(`Ожидалось готовых вложений: ${plan.expectedCount}, получено: ${count}`);
 
   await editor.fill(plan.text);
   const actual = await editorText(editor);
@@ -254,9 +259,8 @@ async function fillPostingDialog(page, plan) {
 async function verifyPreparedForm(page, plan) {
   const dialog = newPostDialog(page);
   if (!await dialog.count()) throw new Error('Проверенная форма «Новый пост» больше не открыта');
-  await waitForAttachmentCount(dialog, plan.expectedCount);
-  const count = await dialog.locator(ATTACHMENT_SELECTOR).count();
-  if (count !== plan.expectedCount) throw new Error('Количество вложений изменилось после проверки');
+  const { count, ready } = await attachmentState(dialog);
+  if (count !== plan.expectedCount || !ready) throw new Error('Количество или готовность вложений изменились после проверки');
   const editor = dialog.locator('[data-testid="posting_base_screen_input_message"], [role="textbox"][contenteditable="true"][aria-label="Напишите что-нибудь..."]');
   const actual = await editorText(editor);
   const expected = normalizeNewlines(plan.text);
@@ -379,6 +383,7 @@ function matchKnownAdvertisement(value, advertisements) {
 
 async function inspectSuggestedPosts(page, advertisements, { expectedCount = null } = {}) {
   const postIds = new Set();
+  const reviewedPosts = new Map();
   let stableRounds = 0;
   for (let attempt = 0; attempt < 20 && stableRounds < 2; attempt += 1) {
     const sizeBefore = postIds.size;
@@ -389,8 +394,10 @@ async function inspectSuggestedPosts(page, advertisements, { expectedCount = nul
       if (postId) postIds.add(postId);
       const textLocator = post.locator(POST_TEXT_SELECTOR);
       if (!await textLocator.count()) continue;
-      const match = matchKnownAdvertisement(await renderedText(textLocator), advertisements);
-      if (match) return { postIds: [...postIds], duplicate: { animal: match.animal, postId }, complete: true };
+      const text = await renderedText(textLocator);
+      reviewedPosts.set(postId || `without-id-${index}`, { postId, text });
+      const match = matchKnownAdvertisement(text, advertisements);
+      if (match) return { postIds: [...postIds], posts: [...reviewedPosts.values()], duplicate: { animal: match.animal, postId }, complete: true };
     }
     stableRounds = postIds.size === sizeBefore ? stableRounds + 1 : 0;
     if (expectedCount !== null && postIds.size >= expectedCount) break;
@@ -400,6 +407,7 @@ async function inspectSuggestedPosts(page, advertisements, { expectedCount = nul
   }
   return {
     postIds: [...postIds],
+    posts: [...reviewedPosts.values()],
     duplicate: null,
     complete: expectedCount === null || postIds.size >= expectedCount
   };

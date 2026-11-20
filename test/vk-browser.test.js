@@ -3,6 +3,7 @@ const assert = require('node:assert/strict');
 const {
   canonicalRenderedText,
   countPreviewAttachments,
+  inspectSuggestedPosts,
   isTextlessSettingsPreview,
   matchKnownAdvertisement,
   parseResultUrl,
@@ -11,6 +12,28 @@ const {
   selectGroupPage,
   waitForAttachmentCount
 } = require('../scripts/lib/vk-browser');
+
+test('returns reviewed suggestion texts across scrolling and still blocks known advertisements', async () => {
+  let round = 0;
+  const entries = [
+    { postId: '-1_1', text: 'Чужое объявление о собаке' },
+    { postId: '-1_2', text: 'Купер ищет дом' }
+  ];
+  const page = {
+    locator: () => ({
+      count: async () => 1,
+      nth: () => ({
+        getAttribute: async () => entries[round].postId,
+        locator: () => ({ count: async () => 1, evaluate: async () => entries[round].text })
+      })
+    }),
+    evaluate: async () => { round = 1; },
+    waitForTimeout: async () => {}
+  };
+  const result = await inspectSuggestedPosts(page, [{ animal: 'Купер', text: 'Купер ищет дом' }], { expectedCount: 2 });
+  assert.deepEqual(result.posts, entries);
+  assert.deepEqual(result.duplicate, { animal: 'Купер', postId: '-1_2' });
+});
 
 test('prefers the CLI page without touching another tab of the same group', async () => {
   const touched = [];
